@@ -16,6 +16,7 @@ dependencies = [
     "numpy>=2.4.0",
     "opencv-python>=4.13.0.92",
     "pandas>=2.3.3",
+    "peft>=0.18.0",
     "scikit-learn>=1.8.0",
     "seaborn>=0.13.2",
     "setuptools<82.0.0",
@@ -28,14 +29,10 @@ dependencies = [
 ]
 
 [project.scripts]
-distill-tokens = "dd_token.distill_tokens:main"
-distill-pathmnist-tokens = "dd_token.distill_tokens:main"
-train-eval-token-classifier = "dd_token.train_eval_token_classifier:main"
-train-eval-token-mlp = "dd_token.train_eval_token_mlp:main"
-train-eval-token-resnet = "dd_token.train_eval_token_resnet:main"
-train-baseline-vit = "dd_token.train_baseline_vit:main"
-train-baseline-resnet = "dd_token.train_baseline_resnet:main"
-train-baseline-mlp = "dd_token.train_baseline_mlp:main"
+run-distillation = "dd_distill.cli:main"
+run-baseline-resnet18 = "dd_distill.baseline_resnet18:main"
+train-lora-dreammnist = "dd_distill.train_lora_sd:main"
+quick-eval-resnet18 = "dd_distill.quick_eval_resnet18:main"
 
 [build-system]
 requires = ["hatchling>=1.25.0"]
@@ -45,19 +42,15 @@ build-backend = "hatchling.build"
 package = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dd_token"]
+packages = ["src/dd_distill"]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
 
 [tool.uv.sources]
-torch = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
-]
-torchvision = [
-  { index = "pytorch-cu124", marker = "sys_platform == 'linux'" },
-]
+torch = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu124", marker = "sys_platform == 'linux'" }]
 
 [[tool.uv.index]]
 name = "pytorch-cu124"
