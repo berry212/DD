@@ -19,7 +19,7 @@ uv run run-distillation \
   --prompt-conditioning \
   --guidance-scale 3.0 \
   --clusters-per-class 100 \
-  --sde-steps 100 \
+  --sde-steps 200 \
   --sde-noise-strength 0.2 \
   --encode-batch-size 64 \
   --decode-batch-size 32 \
