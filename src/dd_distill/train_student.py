@@ -181,6 +181,33 @@ def load_distilled_data(distilled_data_path: Path) -> tuple[torch.Tensor, torch.
         raise KeyError(f"Missing keys in {distilled_data_path}: {missing}")
 
     images = payload["images"].float()
+    if not bool(torch.isfinite(images).all()):
+        raise ValueError(f"Distilled images contain NaN/Inf values: {distilled_data_path}")
+
+    min_val = float(images.min().item())
+    max_val = float(images.max().item())
+    if min_val >= 0.0 and max_val <= 1.0:
+        pass
+    elif min_val >= 0.0 and max_val <= 255.0 + 1e-6:
+        print(
+            "[Data] distilled images detected in [0,255], scaling to [0,1]. "
+            f"min={min_val:.4f} max={max_val:.4f}"
+        )
+        images = images / 255.0
+    elif min_val >= -1.0 - 1e-6 and max_val <= 1.0 + 1e-6:
+        print(
+            "[Data] distilled images detected in [-1,1], scaling to [0,1]. "
+            f"min={min_val:.4f} max={max_val:.4f}"
+        )
+        images = (images + 1.0) / 2.0
+    else:
+        print(
+            "[Data] distilled images outside expected range; clipping to [0,1]. "
+            f"min={min_val:.4f} max={max_val:.4f}"
+        )
+        images = images.clamp(0.0, 1.0)
+
+    images = images.clamp(0.0, 1.0)
     labels = payload["labels"].long()
     weights = payload["weights"].float()
     return images, labels, weights
@@ -419,6 +446,7 @@ def train_weighted_student(
     distilled_labels: torch.Tensor,
     distilled_weights: torch.Tensor,
     distilled_soft_labels: torch.Tensor,
+    use_teacher_guidance: bool,
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     train_transform: transforms.Compose,
@@ -477,8 +505,12 @@ def train_weighted_student(
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 logits = model(images)
-                per_sample_soft_ce = -(soft_labels * F.log_softmax(logits.float(), dim=1)).sum(dim=1)
-                loss = (per_sample_soft_ce * sample_weights).sum() / (sample_weights.sum() + 1e-12)
+                if use_teacher_guidance:
+                    per_sample_soft_ce = -(soft_labels * F.log_softmax(logits.float(), dim=1)).sum(dim=1)
+                    loss = (per_sample_soft_ce * sample_weights).sum() / (sample_weights.sum() + 1e-12)
+                else:
+                    per_sample_hard_ce = F.cross_entropy(logits.float(), hard_labels, reduction="none")
+                    loss = (per_sample_hard_ce * sample_weights).sum() / (sample_weights.sum() + 1e-12)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -571,62 +603,68 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
     )
 
-    teacher = train_teacher(
-        train_set=train_set,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        train_transform=train_transform,
-        num_classes=num_classes,
-        epochs=args.teacher_epochs,
-        learning_rate=args.teacher_lr,
-        weight_decay=args.weight_decay,
-        batch_size=args.teacher_batch_size,
-        num_workers=args.num_workers,
-        device=device,
-        amp_enabled=amp_enabled,
-        imagenet_pretrained=args.imagenet_pretrained,
-        backbone=args.teacher_backbone,
-        output_dir=output_dir,
-    )
+    teacher_test_result: dict[str, Any] | None = None
+    if args.teacher_guidance:
+        teacher = train_teacher(
+            train_set=train_set,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            train_transform=train_transform,
+            num_classes=num_classes,
+            epochs=args.teacher_epochs,
+            learning_rate=args.teacher_lr,
+            weight_decay=args.weight_decay,
+            batch_size=args.teacher_batch_size,
+            num_workers=args.num_workers,
+            device=device,
+            amp_enabled=amp_enabled,
+            imagenet_pretrained=args.imagenet_pretrained,
+            backbone=args.teacher_backbone,
+            output_dir=output_dir,
+        )
 
-    teacher_test_detail = evaluate_classifier_detailed(
-        model=teacher,
-        loader=test_loader,
-        device=device,
-        num_classes=num_classes,
-        amp_enabled=amp_enabled,
-    )
-    class_names = {str(i): INFO["dermamnist"]["label"][str(i)] for i in range(num_classes)}
-    teacher_test_result = {
-        "loss": float(teacher_test_detail["loss"]),
-        "accuracy": float(teacher_test_detail["accuracy"]),
-        "class_names": class_names,
-        "per_class_accuracy": teacher_test_detail["per_class_accuracy"],
-        "confusion_matrix": teacher_test_detail["confusion_matrix"],
-    }
+        teacher_test_detail = evaluate_classifier_detailed(
+            model=teacher,
+            loader=test_loader,
+            device=device,
+            num_classes=num_classes,
+            amp_enabled=amp_enabled,
+        )
+        class_names = {str(i): INFO["dermamnist"]["label"][str(i)] for i in range(num_classes)}
+        teacher_test_result = {
+            "loss": float(teacher_test_detail["loss"]),
+            "accuracy": float(teacher_test_detail["accuracy"]),
+            "class_names": class_names,
+            "per_class_accuracy": teacher_test_detail["per_class_accuracy"],
+            "confusion_matrix": teacher_test_detail["confusion_matrix"],
+        }
 
-    with open(output_dir / "teacher_test_results.json", "w", encoding="utf-8") as handle:
-        json.dump(teacher_test_result, handle, indent=2)
+        with open(output_dir / "teacher_test_results.json", "w", encoding="utf-8") as handle:
+            json.dump(teacher_test_result, handle, indent=2)
 
-    print(
-        "[Teacher-Test] "
-        f"loss={teacher_test_result['loss']:.4f} "
-        f"acc={teacher_test_result['accuracy']:.4f}"
-    )
+        print(
+            "[Teacher-Test] "
+            f"loss={teacher_test_result['loss']:.4f} "
+            f"acc={teacher_test_result['accuracy']:.4f}"
+        )
 
-    soft_labels = make_teacher_soft_labels(
-        teacher=teacher,
-        distilled_images=distilled_images,
-        temperature=args.temperature,
-        batch_size=args.eval_batch_size,
-        device=device,
-    )
+        soft_labels = make_teacher_soft_labels(
+            teacher=teacher,
+            distilled_images=distilled_images,
+            temperature=args.temperature,
+            batch_size=args.eval_batch_size,
+            device=device,
+        )
+    else:
+        print("[Teacher] guidance disabled; skipping teacher training and soft-label generation.")
+        soft_labels = F.one_hot(distilled_labels, num_classes=num_classes).float()
 
     training_summary = train_weighted_student(
         distilled_images=distilled_images,
         distilled_labels=distilled_labels,
         distilled_weights=distilled_weights,
         distilled_soft_labels=soft_labels,
+        use_teacher_guidance=bool(args.teacher_guidance),
         val_loader=val_loader,
         test_loader=test_loader,
         train_transform=train_transform,
@@ -649,12 +687,13 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "num_distilled": int(distilled_images.size(0)),
         "amp_enabled": bool(amp_enabled),
         "image_size": int(args.image_size),
+        "teacher_guidance": bool(args.teacher_guidance),
         "teacher_backbone": str(args.teacher_backbone),
         "student_backbone": str(args.student_backbone),
         "temperature": float(args.temperature),
         "teacher_epochs": int(args.teacher_epochs),
-        "teacher_test_loss": float(teacher_test_result["loss"]),
-        "teacher_test_acc": float(teacher_test_result["accuracy"]),
+        "teacher_test_loss": None if teacher_test_result is None else float(teacher_test_result["loss"]),
+        "teacher_test_acc": None if teacher_test_result is None else float(teacher_test_result["accuracy"]),
         "best_val_acc": float(training_summary["best_val_acc"]),
         "test_acc_at_best_val": float(training_summary["test_acc_at_best_val"]),
         "final_test_acc": float(training_summary["final_test_acc"]),
@@ -700,6 +739,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-batch-size", type=int, default=64)
     parser.add_argument("--teacher-lr", type=float, default=3e-4)
     parser.add_argument("--temperature", type=float, default=20.0)
+    parser.add_argument(
+        "--teacher-guidance",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to use a trained teacher for soft-label guidance.",
+    )
 
     parser.add_argument("--train-epochs", type=int, default=20)
     parser.add_argument("--train-batch-size", type=int, default=64)
