@@ -29,10 +29,10 @@ dependencies = [
 ]
 
 [project.scripts]
-run-distillation = "dd_distill.cli:main"
+run-distillation = "dd_distill.distillate:main"
+run-train-distilled-student = "dd_distill.train_student:main"
 run-baseline-resnet18 = "dd_distill.baseline_resnet18:main"
 train-lora-dreammnist = "dd_distill.train_lora_sd:main"
-quick-eval-resnet18 = "dd_distill.quick_eval_resnet18:main"
 
 [build-system]
 requires = ["hatchling>=1.25.0"]

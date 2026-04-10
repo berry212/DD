@@ -10,17 +10,13 @@ from typing import Any, override
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline
 from medmnist import INFO, DermaMNIST
 from PIL import Image
 from sklearn.cluster import MiniBatchKMeans
-from torch import nn
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, TensorDataset
-from torchvision.models import resnet18
+from torch.utils.data import DataLoader, Dataset
 from torchvision.utils import make_grid
-from torchvision.models import ResNet18_Weights
+
 
 @dataclass
 class ClusterResult:
@@ -67,16 +63,13 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_dermamnist(data_root: str) -> tuple[DermaMNIST, DermaMNIST, DermaMNIST, dict[str, Any]]:
+def load_dermamnist_train(data_root: str) -> tuple[DermaMNIST, dict[str, Any]]:
     train_set = DermaMNIST(split="train", download=True, root=data_root, size=224)
-    test_set = DermaMNIST(split="test", download=True, root=data_root, size=224)
-    val_set = DermaMNIST(split="val", download=True, root=data_root, size=224)
-
     num_classes = len(INFO["dermamnist"]["label"])
     label_names = [INFO["dermamnist"]["label"][str(i)] for i in range(num_classes)]
     metadata = {"task_type": "multiclass", "num_classes": num_classes, "label_names": label_names}
+    return train_set, metadata
 
-    return train_set, test_set, val_set, metadata
 
 def dermamnist_class_prompts() -> dict[int, str]:
     label_map = INFO["dermamnist"]["label"]
@@ -86,43 +79,19 @@ def dermamnist_class_prompts() -> dict[int, str]:
     return prompts
 
 
-def build_data_loaders(
+def build_encode_loader(
     train_set: DermaMNIST,
-    val_set: DermaMNIST,
-    test_set: DermaMNIST,
     encode_batch_size: int,
-    eval_batch_size: int,
     num_workers: int,
     device: torch.device,
-) -> tuple[
-    DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    DataLoader[tuple[torch.Tensor, torch.Tensor]],
-]:
-    pin_memory = device.type == "cuda"
-
-    encode_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
+) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
+    return DataLoader(
         DermaMNISTDataset(train_set),
         batch_size=encode_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=pin_memory,
+        pin_memory=(device.type == "cuda"),
     )
-    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        DermaMNISTDataset(val_set),
-        batch_size=eval_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        DermaMNISTDataset(test_set),
-        batch_size=eval_batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    return encode_loader, val_loader, test_loader
 
 
 def load_vae(args: argparse.Namespace, device: torch.device, dtype: torch.dtype) -> tuple[AutoencoderKL, float]:
@@ -157,7 +126,6 @@ def encode_training_images(
     all_latents: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
 
-    vae.eval()
     total_batches = len(data_loader)
     for batch_idx, (images, labels) in enumerate(data_loader, start=1):
         images = images.to(device=device, dtype=dtype)
@@ -211,27 +179,39 @@ def cluster_latents(
         assignments = kmeans.fit_predict(class_latents)
         counts = np.bincount(assignments, minlength=k).astype(np.int64)
 
-        center_chunk = torch.from_numpy(kmeans.cluster_centers_).view(k, *latents.shape[1:]).float()
-        label_chunk = torch.full((k,), fill_value=class_id, dtype=torch.long)
-        count_chunk = torch.from_numpy(counts)
+        non_empty_mask = counts > 0
+        removed_empty = int((~non_empty_mask).sum())
+        if removed_empty > 0:
+            warnings.warn(
+                f"Class {class_id}: removed {removed_empty} zero-count clusters after k-means.",
+                RuntimeWarning,
+            )
 
-        center_chunks.append(center_chunk)
-        label_chunks.append(label_chunk)
-        count_chunks.append(count_chunk)
+        filtered_centers = kmeans.cluster_centers_[non_empty_mask]
+        filtered_counts = counts[non_empty_mask]
+        kept_k = int(filtered_counts.shape[0])
+        if kept_k == 0:
+            warnings.warn(
+                f"Class {class_id}: all clusters are empty, skipping this class.",
+                RuntimeWarning,
+            )
+            continue
 
-        print(f"[Clustering] class={class_id} clusters={k} samples={int(class_latents.shape[0])}")
+        center_chunks.append(torch.from_numpy(filtered_centers).view(kept_k, *latents.shape[1:]).float())
+        label_chunks.append(torch.full((kept_k,), fill_value=class_id, dtype=torch.long))
+        count_chunks.append(torch.from_numpy(filtered_counts))
+
+        print(
+            f"[Clustering] class={class_id} clusters={k} kept={kept_k} "
+            f"removed_empty={removed_empty} samples={int(class_latents.shape[0])}"
+        )
 
     centers = torch.cat(center_chunks, dim=0)
     center_labels = torch.cat(label_chunks, dim=0)
     counts = torch.cat(count_chunks, dim=0)
     weights = counts.float() / counts.float().sum()
 
-    return ClusterResult(
-        centers=centers,
-        labels=center_labels,
-        counts=counts,
-        weights=weights,
-    )
+    return ClusterResult(centers=centers, labels=center_labels, counts=counts, weights=weights)
 
 
 class ReverseSDEDecoder:
@@ -273,7 +253,6 @@ class ReverseSDEDecoder:
         self.pipe.to(device)
         self.pipe.set_progress_bar_config(disable=True)
         self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
-
         self._load_lora_if_provided(lora_path=lora_path, lora_scale=lora_scale)
 
         self.scaling_factor = float(getattr(self.pipe.vae.config, "scaling_factor", 0.18215))
@@ -285,10 +264,7 @@ class ReverseSDEDecoder:
 
         adapter_dir = Path(lora_path)
         if not adapter_dir.exists():
-            warnings.warn(
-                f"LoRA path does not exist: {adapter_dir}. Continue without LoRA.",
-                RuntimeWarning,
-            )
+            warnings.warn(f"LoRA path does not exist: {adapter_dir}. Continue without LoRA.", RuntimeWarning)
             return
 
         loaded = False
@@ -362,20 +338,15 @@ class ReverseSDEDecoder:
 
         latents = centers.to(device=self.device, dtype=self.dtype)
         noise = torch.randn_like(latents)
-        timestep_batch = start_timestep.expand(latents.size(0))
-        latents = self.scheduler.add_noise(latents, noise, timestep_batch)
+        latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
 
         cond_prompt_embeds = self._prompt_embeddings_for_labels(labels)
-        uncond_prompt_embeds = None
-        use_cfg = self.guidance_scale > 1.0
-        if use_cfg:
-            uncond_prompt_embeds = self._null_prompt_embeddings(latents.size(0))
+        uncond_prompt_embeds = self._null_prompt_embeddings(latents.size(0)) if self.guidance_scale > 1.0 else None
 
         for timestep in timesteps[start_idx:]:
             model_input = self.scheduler.scale_model_input(latents, timestep)
 
-            if use_cfg:
-                assert uncond_prompt_embeds is not None
+            if uncond_prompt_embeds is not None:
                 model_input = torch.cat([model_input, model_input], dim=0)
                 prompt_embeds = torch.cat([uncond_prompt_embeds, cond_prompt_embeds], dim=0)
                 noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=prompt_embeds).sample
@@ -406,11 +377,17 @@ class ReverseSDEDecoder:
             torch.cuda.empty_cache()
 
 
-def save_distilled_images(
-    images: torch.Tensor,
-    labels: torch.Tensor,
-    output_dir: Path,
-) -> list[str]:
+def save_preview_grid(images: torch.Tensor, output_path: Path, max_images: int = 100) -> None:
+    num_images = min(max_images, images.size(0))
+    if num_images <= 0:
+        return
+
+    grid = make_grid(images[:num_images], nrow=min(10, num_images), pad_value=1.0)
+    grid_np = (grid.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    Image.fromarray(grid_np).save(output_path)
+
+
+def save_distilled_images(images: torch.Tensor, labels: torch.Tensor, output_dir: Path) -> list[str]:
     image_root = output_dir / "distilled_images"
     image_root.mkdir(parents=True, exist_ok=True)
 
@@ -430,158 +407,43 @@ def save_distilled_images(
     return relative_paths
 
 
-def save_preview_grid(images: torch.Tensor, output_path: Path, max_images: int = 100) -> None:
-    num_images = min(max_images, images.size(0))
-    if num_images <= 0:
-        return
-
-    grid = make_grid(images[:num_images], nrow=min(10, num_images), pad_value=1.0)
-    grid_np = (grid.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-    Image.fromarray(grid_np).save(output_path)
-
-
-def build_classifier(num_classes: int) -> nn.Module:
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    return model
-
-
-@torch.no_grad()
-def evaluate_classifier(
-    model: nn.Module,
-    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    device: torch.device,
-) -> tuple[float, float]:
-    model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
-
-    for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
-
-        logits = model(images)
-        loss = F.cross_entropy(logits, labels)
-
-        total_loss += float(loss.item()) * images.size(0)
-        total_correct += int((logits.argmax(dim=1) == labels).sum().item())
-        total_samples += images.size(0)
-
-    avg_loss = total_loss / max(total_samples, 1)
-    accuracy = total_correct / max(total_samples, 1)
-    return avg_loss, accuracy
-
-
-def train_weighted_student(
-    distilled_images: torch.Tensor,
-    distilled_labels: torch.Tensor,
-    distilled_weights: torch.Tensor,
-    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    num_classes: int,
-    epochs: int,
-    batch_size: int,
-    learning_rate: float,
-    weight_decay: float,
-    device: torch.device,
+def save_distillation_artifacts(
     output_dir: Path,
-) -> dict[str, Any]:
-    train_set = TensorDataset(distilled_images.float(), distilled_labels.long(), distilled_weights.float())
-    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = DataLoader(
-        train_set,
-        batch_size=min(batch_size, len(train_set)),
-        shuffle=True,
-        num_workers=0,
-        pin_memory=(device.type == "cuda"),
+    clustered: ClusterResult,
+    distilled_images: torch.Tensor,
+    saved_paths: list[str],
+    prompt_conditioning: bool,
+    guidance_scale: float,
+) -> None:
+    torch.save(
+        {
+            "centers": clustered.centers,
+            "labels": clustered.labels,
+            "counts": clustered.counts,
+            "weights": clustered.weights,
+            "images": distilled_images,
+            "image_relative_paths": saved_paths,
+        },
+        output_dir / "distilled_data.pt",
     )
 
-    model = build_classifier(num_classes).to(device)
-    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-    best_val_acc = -1.0
-    best_epoch = -1
-    history: list[dict[str, float]] = []
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_weighted_loss = 0.0
-        epoch_correct = 0
-        epoch_samples = 0
-
-        for images, labels, weights in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-            weights = weights.to(device)
-
-            logits = model(images)
-            per_sample_ce = F.cross_entropy(logits, labels, reduction="none")
-            loss = (per_sample_ce * weights).sum() / (weights.sum() + 1e-12)
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-
-            epoch_weighted_loss += float(loss.item()) * images.size(0)
-            epoch_correct += int((logits.argmax(dim=1) == labels).sum().item())
-            epoch_samples += images.size(0)
-
-        train_loss = epoch_weighted_loss / max(epoch_samples, 1)
-        train_acc = epoch_correct / max(epoch_samples, 1)
-        val_loss, val_acc = evaluate_classifier(model, val_loader, device)
-        test_loss, test_acc = evaluate_classifier(model, test_loader, device)
-
-        history.append(
+    with open(output_dir / "distilled_metadata.json", "w", encoding="utf-8") as handle:
+        json.dump(
             {
-                "epoch": float(epoch),
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-                "test_loss": test_loss,
-                "test_acc": test_acc,
-            }
+                "num_distilled": int(clustered.centers.size(0)),
+                "class_labels": [int(v) for v in clustered.labels.tolist()],
+                "cluster_counts": [int(v) for v in clustered.counts.tolist()],
+                "weights": [float(v) for v in clustered.weights.tolist()],
+                "weight_sum": float(clustered.weights.sum().item()),
+                "prompt_conditioning": bool(prompt_conditioning),
+                "guidance_scale": float(guidance_scale),
+            },
+            handle,
+            indent=2,
         )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_epoch = epoch
-            torch.save(
-                {
-                    "model": model.state_dict(),
-                    "epoch": epoch,
-                    "best_val_acc": best_val_acc,
-                },
-                output_dir / "student_best.pt",
-            )
 
-        print(
-            f"[Weighted-Training] epoch={epoch:03d}/{epochs} "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
-        )
-
-    torch.save({"model": model.state_dict(), "history": history}, output_dir / "student_last.pt")
-
-    with open(output_dir / "student_history.json", "w", encoding="utf-8") as handle:
-        json.dump(history, handle, indent=2)
-
-    best_test_acc = 0.0
-    for row in history:
-        if int(row["epoch"]) == best_epoch:
-            best_test_acc = row["test_acc"]
-            break
-
-    return {
-        "best_epoch": best_epoch,
-        "best_val_acc": best_val_acc,
-        "test_acc_at_best_val": best_test_acc,
-        "final_test_acc": history[-1]["test_acc"],
-        "final_test_loss": history[-1]["test_loss"],
-    }
-
-
-def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
     device = resolve_device(args.device)
     output_dir = Path(args.output_dir)
@@ -593,17 +455,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[Setup] device={device}")
     print(f"[Setup] loading dataset from {args.data_root}")
 
-    # 准备数据
-    train_set, test_set, val_set, metadata = load_dermamnist(args.data_root)
+    train_set, metadata = load_dermamnist_train(args.data_root)
     num_classes = metadata["num_classes"]
     print(f"[Setup] train_samples={len(train_set)} num_classes={num_classes}")
 
-    encode_loader, val_loader, test_loader = build_data_loaders(
+    encode_loader = build_encode_loader(
         train_set=train_set,
-        val_set=val_set,
-        test_set=test_set,
         encode_batch_size=args.encode_batch_size,
-        eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         device=device,
     )
@@ -654,58 +512,27 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         guidance_scale=args.guidance_scale,
     )
 
-    distilled_images = reverse_decoder.decode(clustered.centers, clustered.labels, args.decode_batch_size)
-    reverse_decoder.cleanup()
+    try:
+        distilled_images = reverse_decoder.decode(clustered.centers, clustered.labels, args.decode_batch_size)
+    finally:
+        reverse_decoder.cleanup()
 
     distilled_images = distilled_images.float().cpu()
     save_preview_grid(distilled_images, output_dir / "distilled_preview.png")
     saved_paths = save_distilled_images(distilled_images, clustered.labels, output_dir)
 
-    torch.save(
-        {
-            "centers": clustered.centers,
-            "labels": clustered.labels,
-            "counts": clustered.counts,
-            "weights": clustered.weights,
-            "images": distilled_images,
-            "image_relative_paths": saved_paths,
-        },
-        output_dir / "distilled_data.pt",
+    save_distillation_artifacts(
+        output_dir=output_dir,
+        clustered=clustered,
+        distilled_images=distilled_images,
+        saved_paths=saved_paths,
+        prompt_conditioning=args.prompt_conditioning,
+        guidance_scale=args.guidance_scale,
     )
-
-    with open(output_dir / "distilled_metadata.json", "w", encoding="utf-8") as handle:
-        json.dump(
-            {
-                "num_distilled": int(clustered.centers.size(0)),
-                "class_labels": [int(v) for v in clustered.labels.tolist()],
-                "cluster_counts": [int(v) for v in clustered.counts.tolist()],
-                "weights": [float(v) for v in clustered.weights.tolist()],
-                "weight_sum": float(clustered.weights.sum().item()),
-                "prompt_conditioning": bool(args.prompt_conditioning),
-                "guidance_scale": float(args.guidance_scale),
-            },
-            handle,
-            indent=2,
-        )
 
     del vae
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-    training_summary = train_weighted_student(
-        distilled_images=distilled_images,
-        distilled_labels=clustered.labels,
-        distilled_weights=clustered.weights,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        num_classes=num_classes,
-        epochs=args.train_epochs,
-        batch_size=args.train_batch_size,
-        learning_rate=args.train_lr,
-        weight_decay=args.weight_decay,
-        device=device,
-        output_dir=output_dir,
-    )
 
     summary = {
         "data_root": args.data_root,
@@ -715,25 +542,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "num_distilled": int(clustered.centers.size(0)),
         "prompt_conditioning": bool(args.prompt_conditioning),
         "guidance_scale": float(args.guidance_scale),
-        "best_val_acc": float(training_summary["best_val_acc"]),
-        "test_acc_at_best_val": float(training_summary["test_acc_at_best_val"]),
-        "final_test_acc": float(training_summary["final_test_acc"]),
-        "final_test_loss": float(training_summary["final_test_loss"]),
-        "best_epoch": int(training_summary["best_epoch"]),
     }
 
     with open(output_dir / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
-    print("[Done] Pipeline complete.")
+    print("[Done] Distillation complete.")
     print(json.dumps(summary, indent=2))
     return summary
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Dermamnist 224 dataset distillation: Encoding -> Clustering -> Decoding -> Weighted Training"
-    )
+    parser = argparse.ArgumentParser(description="DermaMNIST distillation: Encoding -> Clustering -> Reverse-SDE Decoding")
     parser.add_argument("--data-root", type=str, default="data")
     parser.add_argument("--output-dir", type=str, default="outputs/dermamnist_224_distill")
 
@@ -746,45 +566,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--vae-subfolder",
         type=str,
         default="none",
-        help="Subfolder for AutoencoderKL weights. Set to 'none' when loading a standalone VAE repo.",
+        help="Subfolder for AutoencoderKL weights. Set to 'none' for standalone VAE repo.",
     )
-    parser.add_argument(
-        "--diffusion-model-id",
-        type=str,
-        default="runwayml/stable-diffusion-v1-5",
-    )
+    parser.add_argument("--diffusion-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
     parser.add_argument(
         "--lora-path",
         type=str,
         default="outputs/lora_dreammnist",
         help="Directory of LoRA weights from train-lora-dreammnist.",
     )
-    parser.add_argument(
-        "--lora-scale",
-        type=float,
-        default=0.9,
-        help="LoRA fusion scale used during reverse-SDE decoding.",
-    )
+    parser.add_argument("--lora-scale", type=float, default=0.9)
     parser.add_argument(
         "--prompt-conditioning",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use class-specific text prompts during reverse-SDE decoding.",
+        help="Use class-specific prompts during reverse-SDE decoding.",
     )
-    parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        default=3.0,
-        help="Classifier-free guidance scale for reverse-SDE decoding.",
-    )
+    parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--sde-steps", type=int, default=80)
     parser.add_argument("--sde-noise-strength", type=float, default=0.2)
-
-    parser.add_argument("--train-epochs", type=int, default=30)
-    parser.add_argument("--train-batch-size", type=int, default=64)
-    parser.add_argument("--eval-batch-size", type=int, default=128)
-    parser.add_argument("--train-lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
 
     parser.add_argument("--fp16", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num-workers", type=int, default=6)
@@ -795,7 +595,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    run_pipeline(args)
+    run_distillation(args)
 
 
 if __name__ == "__main__":

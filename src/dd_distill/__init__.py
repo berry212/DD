@@ -1,5 +1,6 @@
-"""Dataset distillation package for Dermamnist 224 pipeline."""
+"""Dataset distillation package for DermaMNIST."""
 
-from .pipeline import main, run_pipeline
+from .distillate import main, run_distillation
+from .train_student import run_training
 
-__all__ = ["main", "run_pipeline"]
+__all__ = ["main", "run_distillation", "run_training"]

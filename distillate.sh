@@ -23,8 +23,8 @@ uv run run-distillation \
   --sde-noise-strength 0.2 \
   --encode-batch-size 64 \
   --decode-batch-size 32 \
-  --train-epochs 30 \
-  --train-batch-size 64 \
-  --eval-batch-size 128 \
   --fp16 \
   "$@"
+
+echo "[INFO] Distillation finished."
+echo "[INFO] Train student with: uv run run-train-distilled-student --data-root data --distilled-data outputs/dermamnist_224_distill/distilled_data.pt --output-dir outputs/dermamnist_224_student"
