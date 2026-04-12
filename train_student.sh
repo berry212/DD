@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DATASET="${DATASET:-dermamnist}"
 BACKBONE="${BACKBONE:-resnet50}"
+IPC="${IPC:-100}"
+DISTILLED_DATA="${DISTILLED_DATA:-outputs/${DATASET}_224_distill_ipc${IPC}/distilled_data.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_student}"
 
 uv run run-train-distilled-student \
+  --dataset "$DATASET" \
   --data-root data \
-  --distilled-data outputs/dermamnist_224_distill/distilled_data.pt \
-  --output-dir outputs/dermamnist_224_student \
+  --distilled-data "$DISTILLED_DATA" \
+  --output-dir "$OUTPUT_DIR" \
   --student-backbone "$BACKBONE" \
   --train-epochs 20 \
   --train-batch-size 64 \

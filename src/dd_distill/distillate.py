@@ -6,20 +6,22 @@ import random
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, override
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline
-from medmnist import INFO, DermaMNIST
 from PIL import Image
+from sklearn.metrics import f1_score, roc_auc_score
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
 from torchvision.utils import make_grid
+
+from .datasets import MedMNISTImageDataset, get_dataset_spec, supported_datasets
 
 
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(3, 1, 1)
@@ -32,32 +34,6 @@ class CLVQResult:
     center_labels: torch.Tensor
     counts: torch.Tensor
     weights: torch.Tensor
-
-
-class DermaMNISTDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    def __init__(
-        self,
-        data: DermaMNIST,
-        transform: transforms.Compose | None = None,
-    ) -> None:
-        super().__init__()
-        self.images = np.ascontiguousarray(data.imgs)
-        self.labels = data.labels.reshape(-1).astype(np.int64, copy=False)
-        self.transform = transform
-
-    @override
-    def __len__(self) -> int:
-        return int(self.images.shape[0])
-
-    @override
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        image_np = self.images[index]
-        if self.transform is not None:
-            image = self.transform(image_np)
-        else:
-            image = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
-        label = torch.tensor(self.labels[index], dtype=torch.long)
-        return image, label
 
 
 def set_global_seed(seed: int) -> None:
@@ -77,15 +53,6 @@ def resolve_device(device_arg: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-def load_dermamnist_splits(data_root: str) -> tuple[DermaMNIST, DermaMNIST, DermaMNIST, int, dict[int, str]]:
-    train_set = DermaMNIST(split="train", download=True, root=data_root, size=224)
-    val_set = DermaMNIST(split="val", download=True, root=data_root, size=224)
-    test_set = DermaMNIST(split="test", download=True, root=data_root, size=224)
-    num_classes = len(INFO["dermamnist"]["label"])
-    class_names = {i: INFO["dermamnist"]["label"][str(i)] for i in range(num_classes)}
-    return train_set, val_set, test_set, num_classes, class_names
 
 
 def normalize_batch(images: torch.Tensor) -> torch.Tensor:
@@ -160,34 +127,90 @@ def evaluate_classifier(
     return avg_loss, accuracy
 
 
+@torch.no_grad()
+def predict_probabilities(
+    model: nn.Module,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    amp_enabled: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    model.eval()
+    y_true_chunks: list[np.ndarray] = []
+    y_prob_chunks: list[np.ndarray] = []
+
+    for images, labels in loader:
+        images = images.to(device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            logits = model(images)
+        probs = F.softmax(logits.float(), dim=1)
+
+        y_true_chunks.append(labels.cpu().numpy())
+        y_prob_chunks.append(probs.cpu().numpy())
+
+    y_true = np.concatenate(y_true_chunks, axis=0)
+    y_prob = np.concatenate(y_prob_chunks, axis=0)
+    return y_true, y_prob
+
+
+def compute_macro_auc(y_true: np.ndarray, y_prob: np.ndarray, num_classes: int) -> float | None:
+    class_counts = np.bincount(y_true, minlength=num_classes)
+    if int((class_counts > 0).sum()) < 2:
+        return None
+
+    y_true_one_hot = np.eye(num_classes, dtype=np.float32)[y_true]
+    try:
+        return float(roc_auc_score(y_true_one_hot, y_prob, multi_class="ovr", average="macro"))
+    except ValueError:
+        return None
+
+
+def evaluate_teacher_baseline_metrics(
+    model: nn.Module,
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    amp_enabled: bool,
+    num_classes: int,
+) -> dict[str, Any]:
+    test_loss, test_acc = evaluate_classifier(model, test_loader, device, amp_enabled=amp_enabled)
+    y_true, y_prob = predict_probabilities(model, test_loader, device, amp_enabled=amp_enabled)
+    y_pred = np.argmax(y_prob, axis=1)
+    test_macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    test_auc = compute_macro_auc(y_true, y_prob, num_classes=num_classes)
+
+    return {
+        "test_loss": float(test_loss),
+        "test_acc": float(test_acc),
+        "test_macro_f1": test_macro_f1,
+        "test_auc": test_auc,
+        "baseline_metrics": {
+            "ACC": float(test_acc),
+            "AUC": test_auc,
+            "MacroF1": test_macro_f1,
+        },
+    }
+
+
 def train_teacher_model(
-    train_set: DermaMNIST,
-    val_set: DermaMNIST,
-    test_set: DermaMNIST,
+    train_set: Any,
+    val_set: Any,
+    test_set: Any,
     num_classes: int,
     args: argparse.Namespace,
     device: torch.device,
     amp_enabled: bool,
-    output_dir: Path,
+    baseline_dir: Path,
 ) -> tuple[nn.Module, dict[str, Any]]:
     train_transform, eval_transform = build_teacher_transforms(args.image_size)
 
-    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        DermaMNISTDataset(train_set, transform=train_transform),
-        batch_size=args.teacher_batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-    )
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        DermaMNISTDataset(val_set, transform=eval_transform),
+        MedMNISTImageDataset(val_set, transform=eval_transform),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        DermaMNISTDataset(test_set, transform=eval_transform),
+        MedMNISTImageDataset(test_set, transform=eval_transform),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -200,81 +223,131 @@ def train_teacher_model(
         imagenet_pretrained=args.imagenet_pretrained,
     ).to(device)
 
-    optimizer = AdamW(teacher.parameters(), lr=args.teacher_lr, weight_decay=args.teacher_weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.teacher_epochs, 1))
-    scaler = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
+    best_ckpt_path = baseline_dir / "teacher_best.pt"
+    best_ckpt: dict[str, Any] | None = None
 
-    best_val_acc = -1.0
-    history: list[dict[str, float]] = []
+    if best_ckpt_path.exists():
+        try:
+            loaded = torch.load(best_ckpt_path, map_location=device)
+            if not isinstance(loaded, dict) or "model" not in loaded:
+                raise KeyError("teacher_best.pt missing required key: model")
+            teacher.load_state_dict(loaded["model"])
+            teacher.eval()
+            best_ckpt = loaded
+            print(f"[Teacher] Found existing checkpoint, skip training: {best_ckpt_path}")
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to load existing teacher checkpoint ({best_ckpt_path}), retraining. error={exc}",
+                RuntimeWarning,
+            )
 
-    for epoch in range(1, args.teacher_epochs + 1):
-        teacher.train()
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-
-        for images, labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                logits = teacher(images)
-                loss = F.cross_entropy(logits, labels)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            total_loss += float(loss.item()) * images.size(0)
-            total_correct += int((logits.argmax(dim=1) == labels).sum().item())
-            total_samples += images.size(0)
-
-        train_loss = total_loss / max(total_samples, 1)
-        train_acc = total_correct / max(total_samples, 1)
-        val_loss, val_acc = evaluate_classifier(teacher, val_loader, device, amp_enabled=amp_enabled)
-        test_loss, test_acc = evaluate_classifier(teacher, test_loader, device, amp_enabled=amp_enabled)
-        scheduler.step()
-
-        history.append(
-            {
-                "epoch": float(epoch),
-                "train_loss": train_loss,
-                "train_acc": train_acc,
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-                "test_loss": test_loss,
-                "test_acc": test_acc,
-            }
+    if best_ckpt is None:
+        train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
+            MedMNISTImageDataset(train_set, transform=train_transform),
+            batch_size=args.teacher_batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
         )
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save({"model": teacher.state_dict(), "best_val_acc": best_val_acc}, output_dir / "teacher_best.pt")
+        optimizer = AdamW(teacher.parameters(), lr=args.teacher_lr, weight_decay=args.teacher_weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.teacher_epochs, 1))
+        scaler = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
 
-        print(
-            f"[Teacher] epoch={epoch:03d}/{args.teacher_epochs} "
-            f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
-        )
+        best_val_acc = -1.0
+        history: list[dict[str, float]] = []
 
-    with open(output_dir / "teacher_history.json", "w", encoding="utf-8") as handle:
-        json.dump(history, handle, indent=2)
+        for epoch in range(1, args.teacher_epochs + 1):
+            teacher.train()
+            total_loss = 0.0
+            total_correct = 0
+            total_samples = 0
 
-    best_ckpt = torch.load(output_dir / "teacher_best.pt", map_location=device)
-    teacher.load_state_dict(best_ckpt["model"])
-    teacher.eval()
+            for images, labels in train_loader:
+                images = images.to(device)
+                labels = labels.to(device)
 
-    final_test_loss, final_test_acc = evaluate_classifier(teacher, test_loader, device, amp_enabled=amp_enabled)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                    logits = teacher(images)
+                    loss = F.cross_entropy(logits, labels)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                total_loss += float(loss.item()) * images.size(0)
+                total_correct += int((logits.argmax(dim=1) == labels).sum().item())
+                total_samples += images.size(0)
+
+            train_loss = total_loss / max(total_samples, 1)
+            train_acc = total_correct / max(total_samples, 1)
+            val_loss, val_acc = evaluate_classifier(teacher, val_loader, device, amp_enabled=amp_enabled)
+            test_loss, test_acc = evaluate_classifier(teacher, test_loader, device, amp_enabled=amp_enabled)
+            scheduler.step()
+
+            history.append(
+                {
+                    "epoch": float(epoch),
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "test_loss": test_loss,
+                    "test_acc": test_acc,
+                }
+            )
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(
+                    {
+                        "model": teacher.state_dict(),
+                        "best_val_acc": best_val_acc,
+                        "epoch": int(epoch),
+                    },
+                    best_ckpt_path,
+                )
+
+            print(
+                f"[Teacher] epoch={epoch:03d}/{args.teacher_epochs} "
+                f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} test_acc={test_acc:.4f}"
+            )
+
+        with open(baseline_dir / "teacher_history.json", "w", encoding="utf-8") as handle:
+            json.dump(history, handle, indent=2)
+
+        best_ckpt = torch.load(best_ckpt_path, map_location=device)
+        teacher.load_state_dict(best_ckpt["model"])
+        teacher.eval()
+
+    baseline_eval = evaluate_teacher_baseline_metrics(
+        teacher,
+        test_loader=test_loader,
+        device=device,
+        amp_enabled=amp_enabled,
+        num_classes=num_classes,
+    )
+    best_val_acc_raw = best_ckpt.get("best_val_acc") if best_ckpt is not None else None
+    best_val_acc = float(best_val_acc_raw) if best_val_acc_raw is not None else None
+
     teacher_summary = {
-        "best_val_acc": float(best_ckpt["best_val_acc"]),
-        "test_loss": float(final_test_loss),
-        "test_acc": float(final_test_acc),
+        "best_val_acc": best_val_acc,
+        "test_loss": baseline_eval["test_loss"],
+        "test_acc": baseline_eval["test_acc"],
+        "test_auc": baseline_eval["test_auc"],
+        "test_macro_f1": baseline_eval["test_macro_f1"],
         "epochs": int(args.teacher_epochs),
         "backbone": str(args.teacher_backbone),
+        "checkpoint_path": str(best_ckpt_path),
+        "baseline_metrics": baseline_eval["baseline_metrics"],
     }
 
-    with open(output_dir / "teacher_summary.json", "w", encoding="utf-8") as handle:
+    with open(baseline_dir / "teacher_summary.json", "w", encoding="utf-8") as handle:
         json.dump(teacher_summary, handle, indent=2)
+
+    with open(baseline_dir / "teacher_baseline_metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(baseline_eval["baseline_metrics"], handle, indent=2)
 
     return teacher, teacher_summary
 
@@ -302,13 +375,13 @@ def make_teacher_soft_labels(
 
 
 def build_encode_loader(
-    train_set: DermaMNIST,
+    train_set: Any,
     encode_batch_size: int,
     num_workers: int,
     device: torch.device,
 ) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
     return DataLoader(
-        DermaMNISTDataset(train_set, transform=None),
+        MedMNISTImageDataset(train_set, transform=None),
         batch_size=encode_batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -631,14 +704,6 @@ class ReverseSDEDecoder:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-
-def dermamnist_class_prompts() -> dict[int, str]:
-    prompts: dict[int, str] = {}
-    for class_id_str, class_name in INFO["dermamnist"]["label"].items():
-        prompts[int(class_id_str)] = f"dermoscopic image of {class_name}"
-    return prompts
-
-
 def save_preview_grid(images: torch.Tensor, output_path: Path, max_images: int = 100) -> None:
     n = min(max_images, images.size(0))
     if n <= 0:
@@ -705,14 +770,29 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
     device = resolve_device(args.device)
     amp_enabled = bool(args.fp16 and device.type == "cuda")
-    output_dir = Path(args.output_dir)
+    dataset_spec = get_dataset_spec(args.dataset)
+    output_dir = Path(args.output_dir or f"outputs/{dataset_spec.name}_224_distill")
+    teacher_baseline_dir = Path(args.teacher_baseline_dir or f"outputs/{dataset_spec.name}_224_distill_baseline")
     output_dir.mkdir(parents=True, exist_ok=True)
+    teacher_baseline_dir.mkdir(parents=True, exist_ok=True)
+
+    run_config = vars(args).copy()
+    run_config["output_dir"] = str(output_dir)
+    run_config["teacher_baseline_dir"] = str(teacher_baseline_dir)
 
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2)
+        json.dump(run_config, handle, indent=2)
 
-    train_set, val_set, test_set, num_classes, class_names = load_dermamnist_splits(args.data_root)
-    print(f"[Setup] device={device} train={len(train_set)} classes={num_classes}")
+    split_bundle = dataset_spec.load_distillation_splits(data_root=args.data_root, image_size=args.image_size)
+    train_set = split_bundle.train_set
+    val_set = split_bundle.val_set
+    test_set = split_bundle.test_set
+    num_classes = split_bundle.num_classes
+    class_names = split_bundle.class_names
+    print(
+        f"[Setup] dataset={dataset_spec.name} device={device} "
+        f"train={len(train_set)} classes={num_classes} baseline_dir={teacher_baseline_dir}"
+    )
 
     teacher, teacher_summary = train_teacher_model(
         train_set=train_set,
@@ -722,7 +802,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         args=args,
         device=device,
         amp_enabled=amp_enabled,
-        output_dir=output_dir,
+        baseline_dir=teacher_baseline_dir,
     )
 
     encode_loader = build_encode_loader(
@@ -756,7 +836,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         check_interval=args.clvq_check_interval,
     )
 
-    class_prompts = {class_id: f"dermoscopic image of {name}" for class_id, name in class_names.items()}
+    class_prompts = dataset_spec.build_class_prompts(class_names)
     decoder = ReverseSDEDecoder(
         model_id=args.diffusion_model_id,
         vae=vae,
@@ -802,12 +882,16 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         torch.cuda.empty_cache()
 
     summary = {
+        "dataset": dataset_spec.name,
         "data_root": args.data_root,
+        "teacher_baseline_dir": str(teacher_baseline_dir),
         "num_classes": int(num_classes),
         "clvq_mode": "class-wise",
         "clusters_per_class": int(args.clusters_per_class),
         "num_distilled": int(distilled_images.size(0)),
         "teacher_test_acc": float(teacher_summary["test_acc"]),
+        "teacher_test_auc": teacher_summary.get("test_auc"),
+        "teacher_test_macro_f1": teacher_summary.get("test_macro_f1"),
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
     }
@@ -821,10 +905,12 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="DermaMNIST distillation: teacher training + VAE encode + class-wise CLVQ + reverse-SDE decode"
+        description="MedMNIST distillation: teacher training + VAE encode + class-wise CLVQ + reverse-SDE decode"
     )
+    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default="data")
-    parser.add_argument("--output-dir", type=str, default="outputs/dermamnist_224_distill")
+    parser.add_argument("--output-dir", type=str, default="")
+    parser.add_argument("--teacher-baseline-dir", type=str, default="")
 
     parser.add_argument("--clusters-per-class", type=int, default=100)
     parser.add_argument("--clvq-gamma0", type=float, default=0.5)

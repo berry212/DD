@@ -9,7 +9,6 @@ from typing import Any, override
 import numpy as np
 import torch
 import torch.nn.functional as F
-from medmnist import INFO, DermaMNIST
 from sklearn.metrics import classification_report, confusion_matrix
 from torch import nn
 from torch.optim import AdamW
@@ -17,27 +16,11 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
 
+from .datasets import MedMNISTImageDataset, get_dataset_spec, supported_datasets
+
 
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(3, 1, 1)
 IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(3, 1, 1)
-
-
-class DermaMNISTDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    def __init__(self, data: DermaMNIST, transform: transforms.Compose) -> None:
-        super().__init__()
-        self.images = np.ascontiguousarray(data.imgs)
-        self.labels = data.labels.reshape(-1).astype(np.int64, copy=False)
-        self.transform = transform
-
-    @override
-    def __len__(self) -> int:
-        return int(self.images.shape[0])
-
-    @override
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        image = self.transform(self.images[index])
-        label = torch.tensor(self.labels[index], dtype=torch.long)
-        return image, label
 
 
 class DistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
@@ -98,17 +81,9 @@ def build_eval_transform(image_size: int) -> transforms.Compose:
     )
 
 
-def load_dermamnist_eval_splits(data_root: str) -> tuple[DermaMNIST, DermaMNIST, int, list[str]]:
-    val_set = DermaMNIST(split="val", download=True, root=data_root, size=224)
-    test_set = DermaMNIST(split="test", download=True, root=data_root, size=224)
-    num_classes = len(INFO["dermamnist"]["label"])
-    class_names = [INFO["dermamnist"]["label"][str(i)] for i in range(num_classes)]
-    return val_set, test_set, num_classes, class_names
-
-
 def build_eval_loaders(
-    val_set: DermaMNIST,
-    test_set: DermaMNIST,
+    val_set: Any,
+    test_set: Any,
     eval_transform: transforms.Compose,
     eval_batch_size: int,
     num_workers: int,
@@ -116,14 +91,14 @@ def build_eval_loaders(
 ) -> tuple[DataLoader[tuple[torch.Tensor, torch.Tensor]], DataLoader[tuple[torch.Tensor, torch.Tensor]]]:
     pin_memory = device.type == "cuda"
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        DermaMNISTDataset(val_set, transform=eval_transform),
+        MedMNISTImageDataset(val_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        DermaMNISTDataset(test_set, transform=eval_transform),
+        MedMNISTImageDataset(test_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -368,16 +343,26 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
     device = resolve_device(args.device)
     amp_enabled = bool(args.amp and device.type == "cuda")
-    output_dir = Path(args.output_dir)
+    dataset_spec = get_dataset_spec(args.dataset)
+    output_dir = Path(args.output_dir or f"outputs/{dataset_spec.name}_224_student")
+    distilled_data_path = Path(args.distilled_data or f"outputs/{dataset_spec.name}_224_distill/distilled_data.pt")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2)
+    run_config = vars(args).copy()
+    run_config["output_dir"] = str(output_dir)
+    run_config["distilled_data"] = str(distilled_data_path)
 
-    val_set, test_set, num_classes, class_names = load_dermamnist_eval_splits(args.data_root)
-    images, weights, soft_labels = load_distilled_triplet(Path(args.distilled_data), num_classes)
+    with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
+        json.dump(run_config, handle, indent=2)
+
+    eval_bundle = dataset_spec.load_student_eval_splits(data_root=args.data_root, image_size=args.image_size)
+    val_set = eval_bundle.val_set
+    test_set = eval_bundle.test_set
+    num_classes = eval_bundle.num_classes
+    class_names = eval_bundle.class_names
+    images, weights, soft_labels = load_distilled_triplet(distilled_data_path, num_classes)
     print(
-        f"[Setup] device={device} N={images.size(0)} "
+        f"[Setup] dataset={dataset_spec.name} device={device} N={images.size(0)} "
         f"weights_sum={weights.sum().item():.6f} soft_shape={tuple(soft_labels.shape)}"
     )
 
@@ -445,8 +430,9 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     print(report_text)
 
     summary = {
+        "dataset": dataset_spec.name,
         "data_root": args.data_root,
-        "distilled_data": args.distilled_data,
+        "distilled_data": str(distilled_data_path),
         "num_classes": int(num_classes),
         "num_distilled": int(images.size(0)),
         "student_backbone": str(args.student_backbone),
@@ -471,9 +457,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train student from distilled triplet data: {images, weights, soft_labels}")
+    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default="data")
-    parser.add_argument("--distilled-data", type=str, default="outputs/dermamnist_224_distill/distilled_data.pt")
-    parser.add_argument("--output-dir", type=str, default="outputs/dermamnist_224_student")
+    parser.add_argument("--distilled-data", type=str, default="")
+    parser.add_argument("--output-dir", type=str, default="")
 
     parser.add_argument("--student-backbone", type=str, default="resnet50", choices=["resnet18", "resnet50"])
     parser.add_argument("--train-epochs", type=int, default=20)
