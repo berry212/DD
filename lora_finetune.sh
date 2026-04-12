@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DATASET="${DATASET:-dermamnist}"
+DATA_NPZ="${DATA_NPZ:-data/${DATASET}_224.npz}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/lora_${DATASET}}"
+
 uv run train-lora-dreammnist \
-  --data-npz data/dermamnist_224.npz \
-  --output-dir outputs/lora_dreammnist \
+  --dataset "$DATASET" \
+  --data-npz "$DATA_NPZ" \
+  --output-dir "$OUTPUT_DIR" \
   --base-model-id runwayml/stable-diffusion-v1-5 \
   --resolution 224 \
   --batch-size 4 \

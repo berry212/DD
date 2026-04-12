@@ -574,7 +574,7 @@ class ReverseSDEDecoder:
         self.noise_strength = float(np.clip(noise_strength, 0.01, 1.0))
         self.class_prompts = dict(class_prompts)
         self.guidance_scale = float(max(0.0, guidance_scale))
-        self._default_prompt = "dermoscopic image of skin lesion"
+        self._default_prompt = next(iter(self.class_prompts.values()), "medical image")
 
         kwargs: dict[str, Any] = {
             "torch_dtype": dtype,
@@ -742,6 +742,8 @@ def save_distillation_artifacts(
     counts: torch.Tensor,
     saved_paths: list[str],
     teacher_summary: dict[str, Any],
+    dataset_name: str,
+    lora_path: str,
 ) -> None:
     # Keep only the triplet required by downstream training.
     torch.save(
@@ -749,11 +751,15 @@ def save_distillation_artifacts(
             "images": images,
             "weights": weights,
             "soft_labels": soft_labels,
+            "dataset": dataset_name,
+            "lora_path": lora_path,
         },
         output_dir / "distilled_data.pt",
     )
 
     metadata = {
+        "dataset": dataset_name,
+        "lora_path": lora_path,
         "num_distilled": int(images.size(0)),
         "weights_sum": float(weights.sum().item()),
         "soft_labels_shape": list(soft_labels.shape),
@@ -766,6 +772,27 @@ def save_distillation_artifacts(
         json.dump(metadata, handle, indent=2)
 
 
+def resolve_lora_path(dataset_name: str, lora_path_arg: str) -> str:
+    explicit = lora_path_arg.strip()
+    if explicit:
+        return explicit
+
+    dataset_default = Path("outputs") / f"lora_{dataset_name}"
+    if dataset_default.exists():
+        return str(dataset_default)
+
+    legacy_default = Path("outputs/lora_dreammnist")
+    if dataset_name == "dermamnist" and legacy_default.exists():
+        warnings.warn(
+            "Using legacy LoRA path outputs/lora_dreammnist for dermamnist. "
+            "Consider migrating to outputs/lora_dermamnist.",
+            RuntimeWarning,
+        )
+        return str(legacy_default)
+
+    return str(dataset_default)
+
+
 def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
     device = resolve_device(args.device)
@@ -773,12 +800,14 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     dataset_spec = get_dataset_spec(args.dataset)
     output_dir = Path(args.output_dir or f"outputs/{dataset_spec.name}_224_distill")
     teacher_baseline_dir = Path(args.teacher_baseline_dir or f"outputs/{dataset_spec.name}_224_distill_baseline")
+    resolved_lora_path = resolve_lora_path(dataset_spec.name, args.lora_path)
     output_dir.mkdir(parents=True, exist_ok=True)
     teacher_baseline_dir.mkdir(parents=True, exist_ok=True)
 
     run_config = vars(args).copy()
     run_config["output_dir"] = str(output_dir)
     run_config["teacher_baseline_dir"] = str(teacher_baseline_dir)
+    run_config["lora_path"] = resolved_lora_path
 
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
         json.dump(run_config, handle, indent=2)
@@ -791,7 +820,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     class_names = split_bundle.class_names
     print(
         f"[Setup] dataset={dataset_spec.name} device={device} "
-        f"train={len(train_set)} classes={num_classes} baseline_dir={teacher_baseline_dir}"
+        f"train={len(train_set)} classes={num_classes} baseline_dir={teacher_baseline_dir} "
+        f"lora_path={resolved_lora_path}"
     )
 
     teacher, teacher_summary = train_teacher_model(
@@ -844,7 +874,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         dtype=vae_dtype,
         num_inference_steps=args.sde_steps,
         noise_strength=args.sde_noise_strength,
-        lora_path=args.lora_path,
+        lora_path=resolved_lora_path,
         lora_scale=args.lora_scale,
         class_prompts=class_prompts,
         guidance_scale=args.guidance_scale,
@@ -875,6 +905,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         counts=clvq.counts,
         saved_paths=saved_paths,
         teacher_summary=teacher_summary,
+        dataset_name=dataset_spec.name,
+        lora_path=resolved_lora_path,
     )
 
     del vae
@@ -894,6 +926,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_test_macro_f1": teacher_summary.get("test_macro_f1"),
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
+        "lora_path": resolved_lora_path,
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -924,7 +957,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--diffusion-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
-    parser.add_argument("--lora-path", type=str, default="outputs/lora_dreammnist")
+    parser.add_argument("--lora-path", type=str, default="")
     parser.add_argument("--lora-scale", type=float, default=0.9)
     parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--sde-steps", type=int, default=200)

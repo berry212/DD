@@ -2,7 +2,14 @@
 set -euo pipefail
 
 DATASET="${DATASET:-dermamnist}"
-LORA_PATH="${LORA_PATH:-outputs/lora_dreammnist}"
+if [[ -n "${LORA_PATH:-}" ]]; then
+  LORA_PATH="${LORA_PATH}"
+else
+  LORA_PATH="outputs/lora_${DATASET}"
+  if [[ "$DATASET" == "dermamnist" && ! -d "$LORA_PATH" && -d "outputs/lora_dreammnist" ]]; then
+    LORA_PATH="outputs/lora_dreammnist"
+  fi
+fi
 IPC="${IPC:-100}"
 TEACHER_BACKBONE="${TEACHER_BACKBONE:-resnet50}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
@@ -36,4 +43,4 @@ uv run run-distillation \
 
 echo "[INFO] Distillation finished."
 echo "[INFO] Teacher baseline folder: ${BASELINE_DIR} (metrics: teacher_baseline_metrics.json)"
-echo "[INFO] Train student with: uv run run-train-distilled-student --dataset ${DATASET} --data-root data --distilled-data ${OUTPUT_DIR}/distilled_data.pt --output-dir outputs/${DATASET}_224_student"
+echo "[INFO] Train student with: uv run run-train-distilled-student --dataset ${DATASET} --data-root data --distilled-data ${OUTPUT_DIR}/distilled_data.pt --output-dir outputs/${DATASET}_224_student_ipc${IPC}"

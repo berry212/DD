@@ -4,8 +4,9 @@ set -euo pipefail
 DATASET="${DATASET:-dermamnist}"
 BACKBONE="${BACKBONE:-resnet50}"
 IPC="${IPC:-100}"
-DISTILLED_DATA="${DISTILLED_DATA:-outputs/${DATASET}_224_distill_ipc${IPC}/distilled_data.pt}"
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_student}"
+DISTILLED_DIR="${DISTILLED_DIR:-outputs/${DATASET}_224_distill_ipc${IPC}}"
+DISTILLED_DATA="${DISTILLED_DATA:-${DISTILLED_DIR}/distilled_data.pt}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_student_ipc${IPC}}"
 
 uv run run-train-distilled-student \
   --dataset "$DATASET" \

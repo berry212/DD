@@ -21,6 +21,8 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer
 
+from .datasets import get_dataset_spec, supported_datasets
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -42,7 +44,7 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_dermamnist_train(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+def load_medmnist_train(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
     arrays = np.load(npz_path)
     expected = {"train_images", "train_labels"}
     missing = expected.difference(arrays.files)
@@ -59,12 +61,20 @@ def maybe_subsample(images: np.ndarray, labels: np.ndarray, max_samples: int, se
     return images[idx], labels[idx]
 
 
-def dermamnist_class_prompts() -> dict[int, str]:
-    labels = INFO["dermamnist"]["label"]
-    prompts: dict[int, str] = {}
-    for k, v in labels.items():
-        prompts[int(k)] = f"dermoscopic image of {v}"
-    return prompts
+def build_dataset_prompts(dataset_spec: Any) -> tuple[dict[int, str], str]:
+    labels = INFO[dataset_spec.medmnist_key]["label"]
+    class_names = {int(k): str(v) for k, v in labels.items()}
+    prompts = dataset_spec.build_class_prompts(class_names)
+    default_prompt = f"{dataset_spec.prompt_prefix} medical class"
+    return prompts, default_prompt
+
+
+def default_data_npz_path(dataset_name: str) -> Path:
+    return Path("data") / f"{dataset_name}_224.npz"
+
+
+def default_lora_output_dir(dataset_name: str) -> Path:
+    return Path("outputs") / f"lora_{dataset_name}"
 
 
 def compute_snr(noise_scheduler: DDPMScheduler, timesteps: torch.Tensor) -> torch.Tensor:
@@ -111,7 +121,7 @@ def create_lr_scheduler(
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-class DermamnistTextDataset(Dataset[dict[str, torch.Tensor]]):
+class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
         images: np.ndarray,
@@ -119,11 +129,14 @@ class DermamnistTextDataset(Dataset[dict[str, torch.Tensor]]):
         tokenizer: CLIPTokenizer,
         resolution: int,
         prompt_dropout_prob: float,
+        class_prompts: dict[int, str],
+        default_prompt: str,
     ) -> None:
         self.images = np.ascontiguousarray(images)
         self.labels = labels.astype(np.int64, copy=False)
         self.tokenizer = tokenizer
-        self.prompts = dermamnist_class_prompts()
+        self.prompts = dict(class_prompts)
+        self.default_prompt = default_prompt
         self.prompt_dropout_prob = float(np.clip(prompt_dropout_prob, 0.0, 1.0))
         self.transform = transforms.Compose(
             [
@@ -141,7 +154,7 @@ class DermamnistTextDataset(Dataset[dict[str, torch.Tensor]]):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         image = self.images[index]
         label = int(self.labels[index])
-        prompt = self.prompts.get(label, f"dermoscopic image of skin lesion class {label}")
+        prompt = self.prompts.get(label, f"{self.default_prompt} class {label}")
         if self.prompt_dropout_prob > 0.0 and random.random() < self.prompt_dropout_prob:
             prompt = ""
 
@@ -165,11 +178,16 @@ class DermamnistTextDataset(Dataset[dict[str, torch.Tensor]]):
 def run(args: argparse.Namespace) -> dict[str, Any]:
     set_seed(args.seed)
     device = resolve_device(args.device)
-    output_dir = Path(args.output_dir)
+    dataset_spec = get_dataset_spec(args.dataset)
+    data_npz_path = Path(args.data_npz) if args.data_npz else default_data_npz_path(dataset_spec.name)
+    output_dir = Path(args.output_dir) if args.output_dir else default_lora_output_dir(dataset_spec.name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    images, labels = load_dermamnist_train(Path(args.data_npz))
+    images, labels = load_medmnist_train(data_npz_path)
     images, labels = maybe_subsample(images, labels, args.max_train_samples, args.seed)
+    class_prompts, default_prompt = build_dataset_prompts(dataset_spec)
+
+    print(f"[LoRA-Train] dataset={dataset_spec.name} data_npz={data_npz_path}")
     label_values, label_counts = np.unique(labels, return_counts=True)
     class_distribution = {int(k): int(v) for k, v in zip(label_values.tolist(), label_counts.tolist())}
     print(f"[LoRA-Train] class_distribution={class_distribution}")
@@ -205,12 +223,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     trainable_param_count = int(sum(p.numel() for p in trainable_params))
     print(f"[LoRA-Train] trainable_params={trainable_param_count}")
 
-    dataset = DermamnistTextDataset(
+    dataset = MedMNISTTextDataset(
         images=images,
         labels=labels,
         tokenizer=tokenizer,
         resolution=args.resolution,
         prompt_dropout_prob=args.prompt_dropout_prob,
+        class_prompts=class_prompts,
+        default_prompt=default_prompt,
     )
 
     sampler = create_class_balanced_sampler(labels) if args.class_balance else None
@@ -357,8 +377,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     summary = {
+        "dataset": dataset_spec.name,
         "base_model_id": args.base_model_id,
-        "data_npz": args.data_npz,
+        "data_npz": str(data_npz_path),
         "train_samples_used": int(len(dataset)),
         "resolution": int(args.resolution),
         "rank": int(args.rank),
@@ -391,9 +412,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LoRA fine-tune Stable Diffusion on Dermamnist (dreammnist) train split")
-    parser.add_argument("--data-npz", type=str, default="data/dermamnist_224.npz")
-    parser.add_argument("--output-dir", type=str, default="outputs/lora_dreammnist")
+    parser = argparse.ArgumentParser(description="LoRA fine-tune Stable Diffusion on MedMNIST train split")
+    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--data-npz", type=str, default="")
+    parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--base-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
 
     parser.add_argument("--resolution", type=int, default=224)

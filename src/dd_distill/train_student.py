@@ -110,7 +110,7 @@ def build_eval_loaders(
 def load_distilled_triplet(
     distilled_data_path: Path,
     num_classes: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str]:
     payload = torch.load(distilled_data_path, map_location="cpu")
 
     required = {"images", "weights", "soft_labels"}
@@ -121,6 +121,8 @@ def load_distilled_triplet(
     images = payload["images"].float()
     weights = payload["weights"].float().view(-1)
     soft_labels = payload["soft_labels"].float()
+    distilled_dataset = str(payload.get("dataset", "")).strip().lower()
+    distilled_lora_path = str(payload.get("lora_path", "")).strip()
 
     if images.ndim != 4:
         raise ValueError(f"images must be 4D (N,C,H,W), got {tuple(images.shape)}")
@@ -162,7 +164,7 @@ def load_distilled_triplet(
 
     soft_labels = soft_labels.clamp_min(0.0)
     soft_labels = soft_labels / soft_labels.sum(dim=1, keepdim=True).clamp_min(1e-12)
-    return images, weights, soft_labels
+    return images, weights, soft_labels, distilled_dataset, distilled_lora_path
 
 
 def build_classifier(
@@ -360,7 +362,15 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     test_set = eval_bundle.test_set
     num_classes = eval_bundle.num_classes
     class_names = eval_bundle.class_names
-    images, weights, soft_labels = load_distilled_triplet(distilled_data_path, num_classes)
+    images, weights, soft_labels, distilled_dataset, distilled_lora_path = load_distilled_triplet(
+        distilled_data_path,
+        num_classes,
+    )
+    if distilled_dataset and distilled_dataset != dataset_spec.name:
+        raise ValueError(
+            "Distilled data dataset mismatch: "
+            f"expected={dataset_spec.name} actual={distilled_dataset} path={distilled_data_path}"
+        )
     print(
         f"[Setup] dataset={dataset_spec.name} device={device} N={images.size(0)} "
         f"weights_sum={weights.sum().item():.6f} soft_shape={tuple(soft_labels.shape)}"
@@ -435,6 +445,8 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "distilled_data": str(distilled_data_path),
         "num_classes": int(num_classes),
         "num_distilled": int(images.size(0)),
+        "distilled_dataset": distilled_dataset or dataset_spec.name,
+        "distilled_lora_path": distilled_lora_path,
         "student_backbone": str(args.student_backbone),
         "amp_enabled": bool(amp_enabled),
         "best_epoch": int(training_summary["best_epoch"]),
