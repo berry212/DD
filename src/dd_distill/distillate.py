@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import warnings
 from dataclasses import dataclass
@@ -53,6 +54,10 @@ def resolve_device(device_arg: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def default_data_root() -> str:
+    return os.getenv("HF_DATASETS_CACHE") or os.getenv("HF_HOME", "data")
 
 
 def normalize_batch(images: torch.Tensor) -> torch.Tensor:
@@ -941,7 +946,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="MedMNIST distillation: teacher training + VAE encode + class-wise CLVQ + reverse-SDE decode"
     )
     parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
-    parser.add_argument("--data-root", type=str, default="data")
+    parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--teacher-baseline-dir", type=str, default="")
 

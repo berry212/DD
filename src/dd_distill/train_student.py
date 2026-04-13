@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any, override
@@ -68,6 +69,10 @@ def resolve_device(device_arg: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def default_data_root() -> str:
+    return os.getenv("HF_DATASETS_CACHE") or os.getenv("HF_HOME", "data")
 
 
 def build_eval_transform(image_size: int) -> transforms.Compose:
@@ -470,7 +475,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train student from distilled triplet data: {images, weights, soft_labels}")
     parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
-    parser.add_argument("--data-root", type=str, default="data")
+    parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--distilled-data", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")
 

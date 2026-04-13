@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any
@@ -43,21 +44,11 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_medmnist_train(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    arrays = np.load(npz_path)
-    expected = {"train_images", "train_labels"}
-    missing = expected.difference(arrays.files)
-    if missing:
-        raise KeyError(f"Missing keys in {npz_path}: {sorted(missing)}")
-    return arrays["train_images"], arrays["train_labels"].reshape(-1)
-
-
-def maybe_subsample(images: np.ndarray, labels: np.ndarray, max_samples: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
-    if max_samples <= 0 or max_samples >= len(images):
-        return images, labels
+def build_sample_indices(total_samples: int, max_samples: int, seed: int) -> np.ndarray:
+    if max_samples <= 0 or max_samples >= total_samples:
+        return np.arange(total_samples, dtype=np.int64)
     rng = np.random.default_rng(seed)
-    idx = rng.choice(len(images), size=max_samples, replace=False)
-    return images[idx], labels[idx]
+    return np.asarray(rng.choice(total_samples, size=max_samples, replace=False), dtype=np.int64)
 
 
 def build_dataset_prompts(
@@ -71,8 +62,13 @@ def build_dataset_prompts(
     return prompts, default_prompt
 
 
+def default_data_root() -> Path:
+    root = os.getenv("HF_DATASETS_CACHE") or os.getenv("HF_HOME", "data")
+    return Path(root).expanduser()
+
+
 def default_data_npz_path(dataset_name: str) -> Path:
-    return Path("data") / f"{dataset_name}_224.npz"
+    return default_data_root() / f"{dataset_name}_224.npz"
 
 
 def default_lora_output_dir(dataset_name: str) -> Path:
@@ -126,20 +122,29 @@ def create_lr_scheduler(
 class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
-        images: np.ndarray,
-        labels: np.ndarray,
+        split_data: Any,
+        sample_indices: np.ndarray,
         tokenizer: CLIPTokenizer,
         resolution: int,
         prompt_dropout_prob: float,
         class_prompts: dict[int, str],
         default_prompt: str,
     ) -> None:
-        self.images = np.ascontiguousarray(images)
-        self.labels = labels.astype(np.int64, copy=False)
+        self.split_data = split_data
+        self.sample_indices = np.ascontiguousarray(sample_indices, dtype=np.int64)
         self.tokenizer = tokenizer
         self.prompts = dict(class_prompts)
         self.default_prompt = default_prompt
         self.prompt_dropout_prob = float(np.clip(prompt_dropout_prob, 0.0, 1.0))
+
+        if hasattr(split_data, "get_all_labels"):
+            self.labels = np.asarray(split_data.get_all_labels()).reshape(-1).astype(np.int64, copy=False)
+        else:
+            self.labels = np.asarray(split_data.labels).reshape(-1).astype(np.int64, copy=False)
+
+        self.images = split_data.imgs if hasattr(split_data, "imgs") else None
+        self._split_accessor = split_data if hasattr(split_data, "get_image_and_label") else None
+
         self.transform = transforms.Compose(
             [
                 transforms.ToPILImage(),
@@ -151,11 +156,18 @@ class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
         )
 
     def __len__(self) -> int:
-        return int(self.images.shape[0])
+        return int(self.sample_indices.shape[0])
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        image = self.images[index]
-        label = int(self.labels[index])
+        source_idx = int(self.sample_indices[index])
+        if self._split_accessor is not None:
+            image, label = self._split_accessor.get_image_and_label(source_idx)
+        else:
+            image = self.images[source_idx]
+            label = int(self.labels[source_idx])
+
+        image = np.asarray(image)
+        label = int(label)
         prompt = self.prompts.get(label, f"{self.default_prompt} class {label}")
         if self.prompt_dropout_prob > 0.0 and random.random() < self.prompt_dropout_prob:
             prompt = ""
@@ -181,20 +193,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     set_seed(args.seed)
     device = resolve_device(args.device)
     dataset_spec = get_dataset_spec(args.dataset)
-    data_npz_path = Path(args.data_npz) if args.data_npz else default_data_npz_path(dataset_spec.name)
+    data_root = Path(args.data_root).expanduser()
+    data_root.mkdir(parents=True, exist_ok=True)
+
+    if args.data_npz:
+        print("[LoRA-Train] --data-npz is deprecated and ignored; loading data directly from dataset split.")
+
     output_dir = Path(args.output_dir) if args.output_dir else default_lora_output_dir(dataset_spec.name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    images, labels = load_medmnist_train(data_npz_path)
-    images, labels = maybe_subsample(images, labels, args.max_train_samples, args.seed)
-    data_root_for_labels = str(data_npz_path.parent)
+    train_split, class_names = dataset_spec.load_lora_train_split(data_root=str(data_root), image_size=args.resolution)
+    labels_all = np.asarray(
+        train_split.get_all_labels() if hasattr(train_split, "get_all_labels") else train_split.labels,
+        dtype=np.int64,
+    ).reshape(-1)
+    sample_indices = build_sample_indices(len(labels_all), args.max_train_samples, args.seed)
+    labels = labels_all[sample_indices]
+
+    data_root_for_labels = str(data_root)
     class_prompts, default_prompt = build_dataset_prompts(
         dataset_spec=dataset_spec,
         data_root=data_root_for_labels,
         image_size=args.resolution,
     )
 
-    print(f"[LoRA-Train] dataset={dataset_spec.name} data_npz={data_npz_path}")
+    print(f"[LoRA-Train] dataset={dataset_spec.name} data_root={data_root}")
     label_values, label_counts = np.unique(labels, return_counts=True)
     class_distribution = {int(k): int(v) for k, v in zip(label_values.tolist(), label_counts.tolist())}
     print(f"[LoRA-Train] class_distribution={class_distribution}")
@@ -231,8 +254,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[LoRA-Train] trainable_params={trainable_param_count}")
 
     dataset = MedMNISTTextDataset(
-        images=images,
-        labels=labels,
+        split_data=train_split,
+        sample_indices=sample_indices,
         tokenizer=tokenizer,
         resolution=args.resolution,
         prompt_dropout_prob=args.prompt_dropout_prob,
@@ -386,7 +409,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "dataset": dataset_spec.name,
         "base_model_id": args.base_model_id,
-        "data_npz": str(data_npz_path),
+        "data_root": str(data_root),
+        "data_npz": str(Path(args.data_npz).expanduser()) if args.data_npz else "",
         "train_samples_used": int(len(dataset)),
         "resolution": int(args.resolution),
         "rank": int(args.rank),
@@ -421,6 +445,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="LoRA fine-tune Stable Diffusion on MedMNIST train split")
     parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--data-root", type=str, default=str(default_data_root()))
     parser.add_argument("--data-npz", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--base-model-id", type=str, default="runwayml/stable-diffusion-v1-5")

@@ -2,12 +2,12 @@
 set -euo pipefail
 
 DATASET="${DATASET:-dermamnist}"
-DATA_NPZ="${DATA_NPZ:-data/${DATASET}_224.npz}"
+DATA_ROOT="${DATA_ROOT:-${HF_DATASETS_CACHE:-${HF_HOME:-data}}}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/lora_${DATASET}}"
 
 uv run train-lora-dreammnist \
   --dataset "$DATASET" \
-  --data-npz "$DATA_NPZ" \
+  --data-root "$DATA_ROOT" \
   --output-dir "$OUTPUT_DIR" \
   --base-model-id runwayml/stable-diffusion-v1-5 \
   --resolution 224 \

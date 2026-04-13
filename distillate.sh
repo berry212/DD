@@ -2,6 +2,7 @@
 set -euo pipefail
 
 DATASET="${DATASET:-dermamnist}"
+DATA_ROOT="${DATA_ROOT:-${HF_DATASETS_CACHE:-${HF_HOME:-data}}}"
 if [[ -n "${LORA_PATH:-}" ]]; then
   LORA_PATH="${LORA_PATH}"
 else
@@ -23,7 +24,7 @@ fi
 
 uv run run-distillation \
   --dataset "$DATASET" \
-  --data-root data \
+  --data-root "$DATA_ROOT" \
   --output-dir "$OUTPUT_DIR" \
   --teacher-baseline-dir "$BASELINE_DIR" \
   --vae-model-id stabilityai/sd-vae-ft-mse \
@@ -43,4 +44,4 @@ uv run run-distillation \
 
 echo "[INFO] Distillation finished."
 echo "[INFO] Teacher baseline folder: ${BASELINE_DIR} (metrics: teacher_baseline_metrics.json)"
-echo "[INFO] Train student with: uv run run-train-distilled-student --dataset ${DATASET} --data-root data --distilled-data ${OUTPUT_DIR}/distilled_data.pt --output-dir outputs/${DATASET}_224_student_ipc${IPC}"
+echo "[INFO] Train student with: uv run run-train-distilled-student --dataset ${DATASET} --data-root ${DATA_ROOT} --distilled-data ${OUTPUT_DIR}/distilled_data.pt --output-dir outputs/${DATASET}_224_student_ipc${IPC}"

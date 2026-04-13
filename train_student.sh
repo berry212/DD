@@ -2,6 +2,7 @@
 set -euo pipefail
 
 DATASET="${DATASET:-dermamnist}"
+DATA_ROOT="${DATA_ROOT:-${HF_DATASETS_CACHE:-${HF_HOME:-data}}}"
 BACKBONE="${BACKBONE:-resnet50}"
 IPC="${IPC:-100}"
 DISTILLED_DIR="${DISTILLED_DIR:-outputs/${DATASET}_224_distill_ipc${IPC}}"
@@ -10,7 +11,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_student_ipc${IPC}}"
 
 uv run run-train-distilled-student \
   --dataset "$DATASET" \
-  --data-root data \
+  --data-root "$DATA_ROOT" \
   --distilled-data "$DISTILLED_DATA" \
   --output-dir "$OUTPUT_DIR" \
   --student-backbone "$BACKBONE" \
