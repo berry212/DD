@@ -1,0 +1,13 @@
+DATASET=bloodmnist bash lora_finetune.sh
+DATASET=bloodmnist IPC=200 bash distillate.sh
+DATASET=bloodmnist IPC=200 bash train_student.sh
+
+
+全量下载并生成本地训练文件：
+bash download_nih_chest_xray14.sh
+NIH LoRA 微调：
+DATASET=nih_chest_xray14 bash lora_finetune.sh
+NIH 蒸馏：
+DATASET=nih_chest_xray14 IPC=50 bash distillate.sh
+NIH 学生训练：
+DATASET=nih_chest_xray14 IPC=200 bash train_student.sh

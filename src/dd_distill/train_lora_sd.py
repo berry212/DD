@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.training_utils import cast_training_params
-from medmnist import INFO
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 from torch.optim import AdamW
@@ -61,9 +60,12 @@ def maybe_subsample(images: np.ndarray, labels: np.ndarray, max_samples: int, se
     return images[idx], labels[idx]
 
 
-def build_dataset_prompts(dataset_spec: Any) -> tuple[dict[int, str], str]:
-    labels = INFO[dataset_spec.medmnist_key]["label"]
-    class_names = {int(k): str(v) for k, v in labels.items()}
+def build_dataset_prompts(
+    dataset_spec: Any,
+    data_root: str,
+    image_size: int,
+) -> tuple[dict[int, str], str]:
+    class_names = dataset_spec.class_names(data_root=data_root, image_size=image_size)
     prompts = dataset_spec.build_class_prompts(class_names)
     default_prompt = f"{dataset_spec.prompt_prefix} medical class"
     return prompts, default_prompt
@@ -185,7 +187,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     images, labels = load_medmnist_train(data_npz_path)
     images, labels = maybe_subsample(images, labels, args.max_train_samples, args.seed)
-    class_prompts, default_prompt = build_dataset_prompts(dataset_spec)
+    data_root_for_labels = str(data_npz_path.parent)
+    class_prompts, default_prompt = build_dataset_prompts(
+        dataset_spec=dataset_spec,
+        data_root=data_root_for_labels,
+        image_size=args.resolution,
+    )
 
     print(f"[LoRA-Train] dataset={dataset_spec.name} data_npz={data_npz_path}")
     label_values, label_counts = np.unique(labels, return_counts=True)
