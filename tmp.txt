@@ -8,3 +8,12 @@ NIH 蒸馏：
 DATASET=nih_chest_xray14 IPC=50 bash distillate.sh
 NIH 学生训练：
 DATASET=nih_chest_xray14 IPC=200 bash train_student.sh
+
+微调
+DATASET=odir-5k DATA_ROOT=./data bash lora_finetune.sh
+教师训练
+DATASET=odir-5k DATA_ROOT=./data bash baseline.sh
+蒸馏
+DATASET=odir-5k DATA_ROOT=./data IPC=100 bash distillate.sh
+蒸馏数据训练学生模型
+DATASET=odir-5k DATA_ROOT=./data IPC=100 bash train_student.sh

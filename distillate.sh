@@ -37,8 +37,8 @@ uv run run-distillation \
   --teacher-epochs "$TEACHER_EPOCHS" \
   --sde-steps 200 \
   --sde-noise-strength 0.2 \
-  --encode-batch-size 64 \
-  --decode-batch-size 32 \
+  --encode-batch-size 4 \
+  --decode-batch-size 4 \
   --fp16 \
   "$@"
 

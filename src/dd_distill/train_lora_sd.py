@@ -24,6 +24,13 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from .datasets import get_dataset_spec, supported_datasets
 
 
+def normalize_dataset_name(dataset: str) -> str:
+    key = str(dataset).strip().lower().replace("_", "-")
+    if key == "odir5k":
+        return "odir-5k"
+    return key
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -443,8 +450,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LoRA fine-tune Stable Diffusion on MedMNIST train split")
-    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser = argparse.ArgumentParser(
+        description="LoRA fine-tune Stable Diffusion on supported ophthalmic/medical datasets"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=normalize_dataset_name,
+        default="dermamnist",
+        choices=supported_datasets(),
+    )
     parser.add_argument("--data-root", type=str, default=str(default_data_root()))
     parser.add_argument("--data-npz", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")

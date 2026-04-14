@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ast
+import csv
+import warnings
 from abc import ABC
 from dataclasses import dataclass
 from io import BytesIO
+from pathlib import Path
 from typing import Any, cast, override
 
 import numpy as np
@@ -12,6 +16,7 @@ from datasets import DatasetDict as HFDatasetDict
 from datasets import load_dataset
 from medmnist import INFO, BloodMNIST, DermaMNIST
 from PIL import Image
+from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from torchvision import transforms
 
@@ -35,7 +40,20 @@ NIH_CLASS_ORDER = [
     "No Finding",
 ]
 
+ODIR_CLASS_ORDER = ["N", "D", "G", "C", "A", "H", "M", "O"]
+ODIR_CLASS_DISPLAY = {
+    "N": "normal",
+    "D": "diabetic_retinopathy",
+    "G": "glaucoma",
+    "C": "cataract",
+    "A": "age_related_macular_degeneration",
+    "H": "hypertension",
+    "M": "myopia",
+    "O": "other_abnormalities",
+}
 
+
+# 用于蒸馏的数据集划分
 @dataclass(frozen=True)
 class DistillationSplits:
     train_set: Any
@@ -45,18 +63,13 @@ class DistillationSplits:
     class_names: dict[int, str]
 
 
+# 用于测试的数据集划分
 @dataclass(frozen=True)
 class StudentEvalSplits:
     val_set: Any
     test_set: Any
     num_classes: int
     class_names: list[str]
-
-
-@dataclass(frozen=True)
-class ArraySplitData:
-    imgs: np.ndarray
-    labels: np.ndarray
 
 
 class HFNIHChestXraySplit:
@@ -108,9 +121,10 @@ class HFNIHChestXraySplit:
             if idx is not None:
                 mapped_indices.append(int(idx))
 
-        disease_indices = [idx for idx in mapped_indices if idx != self.no_finding_idx]
-        if disease_indices:
-            return int(min(disease_indices))
+        # Preserve source annotation order: use the first disease label if present.
+        for idx in mapped_indices:
+            if idx != self.no_finding_idx:
+                return int(idx)
 
         if self.no_finding_idx in mapped_indices:
             return int(self.no_finding_idx)
@@ -166,6 +180,27 @@ class HFNIHChestXraySplit:
         return self.labels
 
 
+class ODIR5KSplit:
+    def __init__(self, image_paths: list[Path], labels: np.ndarray) -> None:
+        self.image_paths = [Path(p) for p in image_paths]
+        self.labels = np.asarray(labels).reshape(-1).astype(np.int64, copy=False)
+        if len(self.image_paths) != int(self.labels.shape[0]):
+            raise ValueError("ODIR-5K split images/labels size mismatch.")
+
+    def __len__(self) -> int:
+        return int(len(self.image_paths))
+
+    def get_image_and_label(self, index: int) -> tuple[np.ndarray, int]:
+        idx = int(index)
+        image_path = self.image_paths[idx]
+        with Image.open(image_path) as pil_image:
+            image_np = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
+        return np.ascontiguousarray(image_np), int(self.labels[idx])
+
+    def get_all_labels(self) -> np.ndarray:
+        return self.labels
+
+
 class MedMNISTImageDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
@@ -205,7 +240,11 @@ class MedMNISTImageDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
             image_np = np.repeat(image_np, repeats=3, axis=2)
 
         if self.transform is None:
-            image = torch.from_numpy(np.ascontiguousarray(image_np)).permute(2, 0, 1).float()
+            # torch.from_numpy expects a writable buffer; some dataset backends return read-only arrays.
+            image_np_c = np.ascontiguousarray(image_np)
+            if not image_np_c.flags.writeable:
+                image_np_c = image_np_c.copy()
+            image = torch.from_numpy(image_np_c).permute(2, 0, 1).float()
             if image.max().item() > 1.0:
                 image = image / 255.0
         else:
@@ -431,6 +470,247 @@ class NIHChestXray14Spec(BaseDatasetSpec):
             val_set=split_bundle.val_set,
             test_set=split_bundle.test_set,
             num_classes=split_bundle.num_classes,
+            class_names=ordered_names,
+        )
+
+
+class ODIR5KSpec(BaseDatasetSpec):
+    name = "odir-5k"
+    prompt_prefix = "retinal fundus image of"
+
+    def _class_names(self) -> dict[int, str]:
+        return {idx: ODIR_CLASS_DISPLAY[code] for idx, code in enumerate(ODIR_CLASS_ORDER)}
+
+    def _resolve_dataset_root(self, data_root: str) -> Path:
+        root = Path(data_root) / "ODIR-5K"
+        if not root.exists():
+            raise FileNotFoundError(
+                f"ODIR-5K root not found: {root}. Expected structure under ./data/ODIR-5K"
+            )
+        return root
+
+    def _resolve_csv_path(self, dataset_root: Path) -> Path:
+        candidates = [
+            dataset_root / "full_df.csv",
+            dataset_root / "ODIR-5K" / "full_df.csv",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+        raise FileNotFoundError(
+            f"Cannot find ODIR-5K metadata CSV. Tried: {[str(p) for p in candidates]}"
+        )
+
+    def _resolve_image_dirs(self, dataset_root: Path) -> list[Path]:
+        candidates = [
+            dataset_root / "preprocessed_images",
+            dataset_root / "ODIR-5K" / "Training Images",
+            dataset_root / "Training Images",
+            dataset_root / "ODIR-5K" / "Testing Images",
+            dataset_root / "Testing Images",
+        ]
+        image_dirs = [path for path in candidates if path.exists()]
+        if not image_dirs:
+            raise FileNotFoundError(
+                f"No ODIR-5K image directories found. Tried: {[str(p) for p in candidates]}"
+            )
+        return image_dirs
+
+    def _resolve_image_path(self, filename: str, image_dirs: list[Path]) -> Path | None:
+        cleaned = str(filename).strip()
+        if not cleaned:
+            return None
+        base_name = Path(cleaned).name
+        for image_dir in image_dirs:
+            candidate = image_dir / base_name
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _label_from_flags(self, row: dict[str, Any]) -> str | None:
+        positives: list[str] = []
+        for code in ODIR_CLASS_ORDER:
+            raw = row.get(code)
+            if raw is None:
+                continue
+            try:
+                if float(raw) > 0.5:
+                    positives.append(code)
+            except (TypeError, ValueError):
+                continue
+        return positives[0] if positives else None
+
+    def _label_from_target(self, row: dict[str, Any]) -> str | None:
+        raw_target = row.get("target")
+        if raw_target is None:
+            return None
+        text = str(raw_target).strip()
+        if not text:
+            return None
+        try:
+            parsed = ast.literal_eval(text)
+        except Exception:
+            return None
+        if not isinstance(parsed, (list, tuple)) or not parsed:
+            return None
+        arr = np.asarray(parsed, dtype=np.float32).reshape(-1)
+        if arr.size < len(ODIR_CLASS_ORDER):
+            return None
+        idx = int(np.argmax(arr[: len(ODIR_CLASS_ORDER)]))
+        if float(arr[idx]) <= 0.0:
+            return None
+        return ODIR_CLASS_ORDER[idx]
+
+    def _parse_label_code(self, row: dict[str, Any]) -> str | None:
+        raw_labels = row.get("labels")
+        if raw_labels is not None:
+            text = str(raw_labels).strip()
+            if text:
+                try:
+                    parsed = ast.literal_eval(text)
+                except Exception:
+                    parsed = text
+
+                if isinstance(parsed, (list, tuple)):
+                    for token in parsed:
+                        code = str(token).strip().upper()
+                        if code in ODIR_CLASS_ORDER:
+                            return code
+                else:
+                    code = str(parsed).strip().upper()
+                    if code in ODIR_CLASS_ORDER:
+                        return code
+
+        from_flags = self._label_from_flags(row)
+        if from_flags is not None:
+            return from_flags
+
+        return self._label_from_target(row)
+
+    def _load_samples(self, data_root: str) -> tuple[list[Path], np.ndarray]:
+        dataset_root = self._resolve_dataset_root(data_root)
+        csv_path = self._resolve_csv_path(dataset_root)
+        image_dirs = self._resolve_image_dirs(dataset_root)
+
+        image_paths: list[Path] = []
+        labels: list[int] = []
+        skipped_no_label = 0
+        skipped_no_image = 0
+
+        with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                code = self._parse_label_code(row)
+                if code is None:
+                    skipped_no_label += 1
+                    continue
+
+                filename = str(row.get("filename", "")).strip()
+                if not filename:
+                    filename = str(row.get("Right-Fundus", "")).strip()
+                if not filename:
+                    filename = str(row.get("Left-Fundus", "")).strip()
+
+                resolved = self._resolve_image_path(filename, image_dirs)
+                if resolved is None:
+                    raw_filepath = str(row.get("filepath", "")).strip()
+                    if raw_filepath:
+                        resolved = self._resolve_image_path(Path(raw_filepath).name, image_dirs)
+
+                if resolved is None:
+                    skipped_no_image += 1
+                    continue
+
+                image_paths.append(resolved)
+                labels.append(ODIR_CLASS_ORDER.index(code))
+
+        if not image_paths:
+            raise RuntimeError(f"No usable ODIR-5K samples found from {csv_path}")
+
+        if skipped_no_label > 0 or skipped_no_image > 0:
+            warnings.warn(
+                "ODIR-5K dropped rows during parsing: "
+                f"no_label={skipped_no_label}, no_image={skipped_no_image}",
+                RuntimeWarning,
+            )
+
+        return image_paths, np.asarray(labels, dtype=np.int64)
+
+    def _build_splits(self, data_root: str) -> tuple[ODIR5KSplit, ODIR5KSplit, ODIR5KSplit]:
+        image_paths, labels = self._load_samples(data_root)
+        indices = np.arange(labels.shape[0], dtype=np.int64)
+
+        try:
+            train_idx, tail_idx = train_test_split(
+                indices,
+                test_size=0.2,
+                random_state=42,
+                shuffle=True,
+                stratify=labels,
+            )
+            tail_labels = labels[tail_idx]
+            val_idx, test_idx = train_test_split(
+                tail_idx,
+                test_size=0.5,
+                random_state=42,
+                shuffle=True,
+                stratify=tail_labels,
+            )
+        except ValueError:
+            warnings.warn(
+                "ODIR-5K stratified split failed, fallback to random split.",
+                RuntimeWarning,
+            )
+            train_idx, tail_idx = train_test_split(
+                indices,
+                test_size=0.2,
+                random_state=42,
+                shuffle=True,
+                stratify=None,
+            )
+            val_idx, test_idx = train_test_split(
+                tail_idx,
+                test_size=0.5,
+                random_state=42,
+                shuffle=True,
+                stratify=None,
+            )
+
+        train_split = ODIR5KSplit([image_paths[int(i)] for i in train_idx], labels[train_idx])
+        val_split = ODIR5KSplit([image_paths[int(i)] for i in val_idx], labels[val_idx])
+        test_split = ODIR5KSplit([image_paths[int(i)] for i in test_idx], labels[test_idx])
+        return train_split, val_split, test_split
+
+    @override
+    def class_names(self, data_root: str = "data", image_size: int = 224) -> dict[int, str]:
+        return self._class_names()
+
+    @override
+    def load_lora_train_split(self, data_root: str, image_size: int) -> tuple[Any, dict[int, str]]:
+        train_set, _, _ = self._build_splits(data_root=data_root)
+        return train_set, self._class_names()
+
+    @override
+    def load_distillation_splits(self, data_root: str, image_size: int) -> DistillationSplits:
+        train_set, val_set, test_set = self._build_splits(data_root=data_root)
+        class_names = self._class_names()
+        return DistillationSplits(
+            train_set=train_set,
+            val_set=val_set,
+            test_set=test_set,
+            num_classes=len(class_names),
+            class_names=class_names,
+        )
+
+    @override
+    def load_student_eval_splits(self, data_root: str, image_size: int) -> StudentEvalSplits:
+        _, val_set, test_set = self._build_splits(data_root=data_root)
+        class_names = self._class_names()
+        ordered_names = [class_names[i] for i in range(len(class_names))]
+        return StudentEvalSplits(
+            val_set=val_set,
+            test_set=test_set,
+            num_classes=len(class_names),
             class_names=ordered_names,
         )
 

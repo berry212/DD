@@ -2,106 +2,28 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
+import os
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.metrics import f1_score, roc_auc_score
 from torch import nn
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from torchvision import transforms
-from torchvision.models import ResNet18_Weights, resnet18
+from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
+
+from .datasets import MedMNISTImageDataset, get_dataset_spec, supported_datasets
+from .utils import *
 
 
-class DermamnistNpzDataset(Dataset[tuple[torch.Tensor, torch.Tensor]]):
-    def __init__(
-        self,
-        images: np.ndarray,
-        labels: np.ndarray,
-        transform: transforms.Compose,
-    ) -> None:
-        self.images = np.ascontiguousarray(images)
-        self.labels = labels.reshape(-1).astype(np.int64, copy=False)
-        self.transform = transform
-
-    def __len__(self) -> int:
-        return int(self.images.shape[0])
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        image = self.images[index]
-        label = int(self.labels[index])
-        image_tensor = self.transform(image)
-        label_tensor = torch.tensor(label, dtype=torch.long)
-        return image_tensor, label_tensor
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def resolve_device(device_arg: str) -> torch.device:
-    if device_arg != "auto":
-        return torch.device(device_arg)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def load_dermamnist_npz(npz_path: Path) -> dict[str, np.ndarray]:
-    arrays = np.load(npz_path)
-    expected_keys = {
-        "train_images",
-        "train_labels",
-        "val_images",
-        "val_labels",
-        "test_images",
-        "test_labels",
-    }
-    missing = expected_keys.difference(arrays.files)
-    if missing:
-        raise KeyError(f"Missing keys in {npz_path}: {sorted(missing)}")
-
-    return {
-        "train_images": arrays["train_images"],
-        "train_labels": arrays["train_labels"],
-        "val_images": arrays["val_images"],
-        "val_labels": arrays["val_labels"],
-        "test_images": arrays["test_images"],
-        "test_labels": arrays["test_labels"],
-    }
-
-
-def maybe_subsample(
-    images: np.ndarray,
-    labels: np.ndarray,
-    max_samples: int,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    if max_samples <= 0 or max_samples >= len(images):
-        return images, labels
-
-    rng = np.random.default_rng(seed)
-    indices = rng.choice(len(images), size=max_samples, replace=False)
-    return images[indices], labels[indices]
-
-
-def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Compose]:
+def build_teacher_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Compose]:
     mean = (0.485, 0.456, 0.406)
     std = (0.229, 0.224, 0.225)
-
     train_transform = transforms.Compose(
         [
             transforms.ToPILImage(),
@@ -122,71 +44,29 @@ def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Co
     return train_transform, eval_transform
 
 
-def create_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader, DataLoader, int]:
-    arrays = load_dermamnist_npz(Path(args.data_npz))
+def build_classifier(num_classes: int, backbone: str, imagenet_pretrained: bool) -> nn.Module:
+    backbone_name = backbone.lower()
+    if backbone_name == "resnet18":
+        weights = ResNet18_Weights.IMAGENET1K_V1 if imagenet_pretrained else None
+        model = resnet18(weights=weights)
+    elif backbone_name == "resnet50":
+        weights = ResNet50_Weights.IMAGENET1K_V2 if imagenet_pretrained else None
+        model = resnet50(weights=weights)
+    else:
+        raise ValueError(f"Unsupported backbone: {backbone}.")
 
-    train_images, train_labels = maybe_subsample(
-        arrays["train_images"], arrays["train_labels"], args.max_train_samples, args.seed
-    )
-    val_images, val_labels = maybe_subsample(arrays["val_images"], arrays["val_labels"], args.max_val_samples, args.seed)
-    test_images, test_labels = maybe_subsample(
-        arrays["test_images"], arrays["test_labels"], args.max_test_samples, args.seed
-    )
-
-    train_labels_1d = train_labels.reshape(-1)
-    val_labels_1d = val_labels.reshape(-1)
-    test_labels_1d = test_labels.reshape(-1)
-    num_classes = int(max(train_labels_1d.max(), val_labels_1d.max(), test_labels_1d.max()) + 1)
-
-    train_transform, eval_transform = build_transforms(args.image_size)
-
-    train_set = DermamnistNpzDataset(train_images, train_labels, train_transform)
-    val_set = DermamnistNpzDataset(val_images, val_labels, eval_transform)
-    test_set = DermamnistNpzDataset(test_images, test_labels, eval_transform)
-
-    loader_kwargs = {
-        "num_workers": args.num_workers,
-        "pin_memory": args.device == "cuda",
-    }
-
-    train_loader = DataLoader(
-        train_set,
-        batch_size=args.batch_size,
-        shuffle=True,
-        **loader_kwargs,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        **loader_kwargs,
-    )
-    test_loader = DataLoader(
-        test_set,
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        **loader_kwargs,
-    )
-
-    return train_loader, val_loader, test_loader, num_classes
-
-
-def build_model(num_classes: int, pretrained: bool) -> nn.Module:
-    weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-    model = resnet18(weights=weights)
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
 
-def train_one_epoch(
+@torch.no_grad()
+def evaluate_classifier(
     model: nn.Module,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
     amp_enabled: bool,
-    scaler: torch.amp.GradScaler,
 ) -> tuple[float, float]:
-    model.train()
+    model.eval()
     total_loss = 0.0
     total_correct = 0
     total_samples = 0
@@ -195,176 +75,246 @@ def train_one_epoch(
         images = images.to(device)
         labels = labels.to(device)
 
-        optimizer.zero_grad(set_to_none=True)
-
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             logits = model(images)
             loss = F.cross_entropy(logits, labels)
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
 
         total_loss += float(loss.item()) * images.size(0)
         total_correct += int((logits.argmax(dim=1) == labels).sum().item())
         total_samples += images.size(0)
 
     avg_loss = total_loss / max(total_samples, 1)
-    avg_acc = total_correct / max(total_samples, 1)
-    return avg_loss, avg_acc
+    accuracy = total_correct / max(total_samples, 1)
+    return avg_loss, accuracy
 
 
 @torch.no_grad()
-def evaluate(
+def predict_probabilities(
     model: nn.Module,
-    loader: DataLoader,
+    loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
     amp_enabled: bool,
-) -> tuple[float, float, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
-
-    all_true: list[np.ndarray] = []
-    all_pred: list[np.ndarray] = []
+    y_true_chunks: list[np.ndarray] = []
+    y_prob_chunks: list[np.ndarray] = []
 
     for images, labels in loader:
         images = images.to(device)
-        labels = labels.to(device)
-
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             logits = model(images)
-            loss = F.cross_entropy(logits, labels)
+        probs = F.softmax(logits.float(), dim=1)
 
-        preds = logits.argmax(dim=1)
+        y_true_chunks.append(labels.cpu().numpy())
+        y_prob_chunks.append(probs.cpu().numpy())
 
-        total_loss += float(loss.item()) * images.size(0)
-        total_correct += int((preds == labels).sum().item())
-        total_samples += images.size(0)
-        all_true.append(labels.cpu().numpy())
-        all_pred.append(preds.cpu().numpy())
-
-    y_true = np.concatenate(all_true, axis=0)
-    y_pred = np.concatenate(all_pred, axis=0)
-
-    avg_loss = total_loss / max(total_samples, 1)
-    avg_acc = total_correct / max(total_samples, 1)
-    return avg_loss, avg_acc, y_true, y_pred
+    y_true = np.concatenate(y_true_chunks, axis=0)
+    y_prob = np.concatenate(y_prob_chunks, axis=0)
+    return y_true, y_prob
 
 
-def class_names_for_dermamnist(num_classes: int) -> list[str]:
-    names = [f"class_{i}" for i in range(num_classes)]
+def compute_macro_auc(y_true: np.ndarray, y_prob: np.ndarray, num_classes: int) -> float | None:
+    class_counts = np.bincount(y_true, minlength=num_classes)
+    if int((class_counts > 0).sum()) < 2:
+        return None
+
+    y_true_one_hot = np.eye(num_classes, dtype=np.float32)[y_true]
     try:
-        from medmnist import INFO
-
-        mapping = INFO["dermamnist"]["label"]
-        names = [mapping.get(str(i), names[i]) for i in range(num_classes)]
-    except Exception:
-        pass
-    return names
+        return float(roc_auc_score(y_true_one_hot, y_prob, multi_class="ovr", average="macro"))
+    except ValueError:
+        return None
 
 
-def write_results(
-    output_dir: Path,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
+def evaluate_teacher_baseline_metrics(
+    model: nn.Module,
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    amp_enabled: bool,
     num_classes: int,
-    summary: dict[str, Any],
-) -> None:
-    class_names = class_names_for_dermamnist(num_classes)
+) -> dict[str, Any]:
+    test_loss, test_acc = evaluate_classifier(model, test_loader, device, amp_enabled=amp_enabled)
+    y_true, y_prob = predict_probabilities(model, test_loader, device, amp_enabled=amp_enabled)
+    y_pred = np.argmax(y_prob, axis=1)
+    test_macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    test_auc = compute_macro_auc(y_true, y_prob, num_classes=num_classes)
 
-    labels = list(range(num_classes))
-    report_dict = classification_report(
-        y_true,
-        y_pred,
-        labels=labels,
-        target_names=class_names,
-        output_dict=True,
-        zero_division=0,
-    )
-    report_text = classification_report(
-        y_true,
-        y_pred,
-        labels=labels,
-        target_names=class_names,
-        digits=4,
-        zero_division=0,
-    )
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-
-    with open(output_dir / "classification_report.txt", "w", encoding="utf-8") as handle:
-        handle.write(report_text)
-
-    report_df = pd.DataFrame(report_dict).transpose()
-    report_df.to_csv(output_dir / "classification_report.csv", index=True)
-
-    cm_df = pd.DataFrame(cm, index=class_names, columns=class_names)
-    cm_df.to_csv(output_dir / "confusion_matrix.csv", index=True)
-
-    preds_df = pd.DataFrame(
-        {
-            "y_true": y_true,
-            "y_pred": y_pred,
-            "correct": (y_true == y_pred).astype(np.int64),
-        }
-    )
-    preds_df.to_csv(output_dir / "test_predictions.csv", index=False)
-
-    metrics = {
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+    return {
+        "test_loss": float(test_loss),
+        "test_acc": float(test_acc),
+        "test_macro_f1": test_macro_f1,
+        "test_auc": test_auc,
+        "baseline_metrics": {
+            "ACC": float(test_acc),
+            "AUC": test_auc,
+            "MacroF1": test_macro_f1,
+        },
     }
 
-    with open(output_dir / "baseline_summary.json", "w", encoding="utf-8") as handle:
-        json.dump({**summary, "test_metrics": metrics}, handle, indent=2)
 
-    print("[Baseline] Test classification report")
-    print(report_text)
-    print(json.dumps(metrics, indent=2))
+def load_teacher_checkpoint(
+    checkpoint_path: Path,
+    num_classes: int,
+    backbone: str,
+    imagenet_pretrained: bool,
+    device: torch.device,
+) -> tuple[nn.Module, dict[str, Any]]:
+    loaded = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(loaded, dict) or "model" not in loaded:
+        raise KeyError(f"{checkpoint_path} missing required key: model")
+
+    teacher = build_classifier(
+        num_classes=num_classes,
+        backbone=backbone,
+        imagenet_pretrained=imagenet_pretrained,
+    ).to(device)
+    teacher.load_state_dict(loaded["model"])
+    teacher.eval()
+    return teacher, loaded
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
-    set_seed(args.seed)
-    device = resolve_device(args.device)
-    args.device = device.type
+def summarize_teacher_model(
+    teacher: nn.Module,
+    test_set: Any,
+    num_classes: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    amp_enabled: bool,
+    baseline_dir: Path,
+    checkpoint_path: Path,
+    best_val_acc: float | None,
+) -> dict[str, Any]:
+    _, eval_transform = build_teacher_transforms(args.image_size)
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
+        MedMNISTImageDataset(test_set, transform=eval_transform),
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    baseline_eval = evaluate_teacher_baseline_metrics(
+        teacher,
+        test_loader=test_loader,
+        device=device,
+        amp_enabled=amp_enabled,
+        num_classes=num_classes,
+    )
 
-    train_loader, val_loader, test_loader, num_classes = create_dataloaders(args)
+    teacher_summary = {
+        "best_val_acc": best_val_acc,
+        "test_loss": baseline_eval["test_loss"],
+        "test_acc": baseline_eval["test_acc"],
+        "test_auc": baseline_eval["test_auc"],
+        "test_macro_f1": baseline_eval["test_macro_f1"],
+        "epochs": int(args.teacher_epochs),
+        "backbone": str(args.teacher_backbone),
+        "checkpoint_path": str(checkpoint_path),
+        "baseline_metrics": baseline_eval["baseline_metrics"],
+    }
 
-    model = build_model(num_classes=num_classes, pretrained=args.pretrained)
-    model.to(device)
+    with open(baseline_dir / "teacher_summary.json", "w", encoding="utf-8") as handle:
+        json.dump(teacher_summary, handle, indent=2)
 
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    with open(baseline_dir / "teacher_baseline_metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(baseline_eval["baseline_metrics"], handle, indent=2)
 
-    amp_enabled = bool(args.amp and device.type == "cuda")
+    test_auc = teacher_summary["test_auc"]
+    test_auc_text = f"{test_auc:.4f}" if test_auc is not None else "nan"
+    print(
+        f"[Teacher] Final metrics: test_acc={teacher_summary['test_acc']:.4f} "
+        f"test_auc={test_auc_text} test_macro_f1={teacher_summary['test_macro_f1']:.4f}"
+    )
+
+    return teacher_summary
+
+
+def train_teacher_baseline(
+    train_set: Any,
+    val_set: Any,
+    test_set: Any,
+    num_classes: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    amp_enabled: bool,
+    baseline_dir: Path,
+) -> tuple[nn.Module, dict[str, Any]]:
+    if args.teacher_epochs <= 0:
+        raise ValueError("teacher_epochs must be positive.")
+
+    train_transform, eval_transform = build_teacher_transforms(args.image_size)
+
+    train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
+        MedMNISTImageDataset(train_set, transform=train_transform),
+        batch_size=args.teacher_batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
+        MedMNISTImageDataset(val_set, transform=eval_transform),
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+    test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
+        MedMNISTImageDataset(test_set, transform=eval_transform),
+        batch_size=args.eval_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    teacher = build_classifier(
+        num_classes=num_classes,
+        backbone=args.teacher_backbone,
+        imagenet_pretrained=args.imagenet_pretrained,
+    ).to(device)
+
+    optimizer = AdamW(teacher.parameters(), lr=args.teacher_lr, weight_decay=args.teacher_weight_decay)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.teacher_epochs, 1))
     scaler = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
 
+    best_ckpt_path = baseline_dir / "teacher_best.pt"
     best_val_acc = -1.0
-    best_epoch = -1
-
     history: list[dict[str, float]] = []
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            amp_enabled=amp_enabled,
-            scaler=scaler,
-        )
 
-        val_loss, val_acc, _, _ = evaluate(
-            model=model,
-            loader=val_loader,
-            device=device,
-            amp_enabled=amp_enabled,
-        )
+    for epoch in range(1, args.teacher_epochs + 1):
+        teacher.train()
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
 
+        for images, labels in tqdm(
+            train_loader,
+            desc=f"Training epoch {epoch}/{args.teacher_epochs}",
+            leave=False,
+            unit="batch",
+        ):
+            images = images.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+                logits = teacher(images)
+                loss = F.cross_entropy(logits, labels)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            total_loss += float(loss.item()) * images.size(0)
+            total_correct += int((logits.argmax(dim=1) == labels).sum().item())
+            total_samples += images.size(0)
+
+        train_loss = total_loss / max(total_samples, 1)
+        train_acc = total_correct / max(total_samples, 1)
+        val_loss, val_acc = evaluate_classifier(teacher, val_loader, device, amp_enabled=amp_enabled)
+        test_loss, test_acc = evaluate_classifier(teacher, test_loader, device, amp_enabled=amp_enabled)
+        y_true, y_prob = predict_probabilities(teacher, test_loader, device, amp_enabled=amp_enabled)
+        y_pred = np.argmax(y_prob, axis=1)
+        test_macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        test_auc = compute_macro_auc(y_true, y_prob, num_classes=num_classes)
         scheduler.step()
 
         history.append(
@@ -374,95 +324,124 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "train_acc": train_acc,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
+                "test_loss": test_loss,
+                "test_acc": test_acc,
+                "test_macro_f1": test_macro_f1,
+                "test_auc": test_auc,
             }
         )
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            best_epoch = epoch
             torch.save(
                 {
-                    "model": model.state_dict(),
-                    "val_acc": val_acc,
-                    "epoch": epoch,
+                    "model": teacher.state_dict(),
+                    "best_val_acc": best_val_acc,
+                    "epoch": int(epoch),
                 },
-                output_dir / "resnet18_best.pt",
+                best_ckpt_path,
             )
 
+        test_auc_text = f"{test_auc:.4f}" if test_auc is not None else "nan"
         print(
-            f"[Train] epoch={epoch:03d}/{args.epochs} "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+            f"[Teacher] epoch={epoch:03d}/{args.teacher_epochs} "
+            f"train_acc={train_acc:.4f} val_acc={val_acc:.4f} test_acc={test_acc:.4f} "
+            f"test_auc={test_auc_text} test_macro_f1={test_macro_f1:.4f}"
         )
 
-    with open(output_dir / "train_history.json", "w", encoding="utf-8") as handle:
+    with open(baseline_dir / "teacher_history.json", "w", encoding="utf-8") as handle:
         json.dump(history, handle, indent=2)
 
-    best_ckpt = torch.load(output_dir / "resnet18_best.pt", map_location=device)
-    model.load_state_dict(best_ckpt["model"])
+    teacher, loaded = load_teacher_checkpoint(
+        checkpoint_path=best_ckpt_path,
+        num_classes=num_classes,
+        backbone=args.teacher_backbone,
+        imagenet_pretrained=args.imagenet_pretrained,
+        device=device,
+    )
+    best_val_acc_raw = loaded.get("best_val_acc")
+    best_val_acc_final = float(best_val_acc_raw) if best_val_acc_raw is not None else None
 
-    test_loss, test_acc, y_true, y_pred = evaluate(
-        model=model,
-        loader=test_loader,
+    teacher_summary = summarize_teacher_model(
+        teacher=teacher,
+        test_set=test_set,
+        num_classes=num_classes,
+        args=args,
         device=device,
         amp_enabled=amp_enabled,
+        baseline_dir=baseline_dir,
+        checkpoint_path=best_ckpt_path,
+        best_val_acc=best_val_acc_final,
     )
 
-    summary = {
-        "data_npz": args.data_npz,
-        "num_classes": num_classes,
-        "pretrained": bool(args.pretrained),
-        "device": device.type,
-        "epochs": int(args.epochs),
-        "batch_size": int(args.batch_size),
-        "eval_batch_size": int(args.eval_batch_size),
-        "best_epoch": int(best_epoch),
-        "best_val_acc": float(best_val_acc),
-        "test_loss": float(test_loss),
-        "test_acc": float(test_acc),
-    }
+    return teacher, teacher_summary
 
-    write_results(
-        output_dir=output_dir,
-        y_true=y_true,
-        y_pred=y_pred,
+
+def run_teacher_baseline(args: argparse.Namespace) -> dict[str, Any]:
+    set_global_seed(args.seed)
+    device = resolve_device(args.device)
+    amp_enabled = bool(args.amp and device.type == "cuda")
+
+    dataset_spec = get_dataset_spec(args.dataset)
+    output_dir = Path(args.output_dir or f"outputs/{dataset_spec.name}_224_distill_baseline")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    run_config = vars(args).copy()
+    run_config["output_dir"] = str(output_dir)
+    with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
+        json.dump(run_config, handle, indent=2)
+
+    split_bundle = dataset_spec.load_distillation_splits(data_root=args.data_root, image_size=args.image_size)
+    train_set = split_bundle.train_set
+    val_set = split_bundle.val_set
+    test_set = split_bundle.test_set
+    num_classes = split_bundle.num_classes
+
+    _, teacher_summary = train_teacher_baseline(
+        train_set=train_set,
+        val_set=val_set,
+        test_set=test_set,
         num_classes=num_classes,
-        summary=summary,
+        args=args,
+        device=device,
+        amp_enabled=amp_enabled,
+        baseline_dir=output_dir,
     )
-
-    print("[Baseline] Summary")
-    print(json.dumps(summary, indent=2))
-    return summary
+    print(json.dumps(teacher_summary, indent=2))
+    return teacher_summary
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ResNet18 baseline training on Dermamnist dataset")
-    parser.add_argument("--data-npz", type=str, default="data/dermamnist_224.npz")
-    parser.add_argument("--output-dir", type=str, default="outputs/dermamnist_resnet18_baseline")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train teacher baseline model for distillation datasets "
+            "(DermaMNIST, BloodMNIST, NIH Chest X-ray14, ODIR-5K)."
+        )
+    )
+    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--data-root", type=str, default=default_data_root())
+    parser.add_argument("--output-dir", type=str, default="")
 
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--teacher-backbone", type=str, default="resnet18", choices=["resnet18", "resnet50"])
+    parser.add_argument("--teacher-epochs", type=int, default=20)
+    parser.add_argument("--teacher-batch-size", type=int, default=128)
+    parser.add_argument("--teacher-lr", type=float, default=3e-4)
+    parser.add_argument("--teacher-weight-decay", type=float, default=1e-4)
+
     parser.add_argument("--eval-batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-
     parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--imagenet-pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
-
-    parser.add_argument("--max-train-samples", type=int, default=0)
-    parser.add_argument("--max-val-samples", type=int, default=0)
-    parser.add_argument("--max-test-samples", type=int, default=0)
-
+    parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--reuse-checkpoint", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    run(args)
+    run_teacher_baseline(args)
 
 
 if __name__ == "__main__":
