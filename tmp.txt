@@ -17,3 +17,8 @@ DATASET=odir-5k DATA_ROOT=./data bash baseline.sh
 DATASET=odir-5k DATA_ROOT=./data IPC=100 bash distillate.sh
 蒸馏数据训练学生模型
 DATASET=odir-5k DATA_ROOT=./data IPC=100 bash train_student.sh
+
+
+DATASET=APTOS_2019_Blindness_Detection DATA_ROOT=data bash lora_finetune.sh
+DATASET=APTOS_2019_Blindness_Detection DATA_ROOT=data IPC=200 bash distillate.sh
+DATASET=APTOS_2019_Blindness_Detection DATA_ROOT=data IPC=200 bash train_student.sh

@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
 
-from .datasets import MedMNISTImageDataset, get_dataset_spec, supported_datasets
+from .datasets import MedMNISTImageDataset, get_dataset_spec, normalize_dataset_key, supported_datasets
 
 
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(3, 1, 1)
@@ -547,7 +547,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train student from distilled triplet data: {images, weights, soft_labels}")
-    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--dataset", type=normalize_dataset_key, default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--distilled-data", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")

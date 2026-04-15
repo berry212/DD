@@ -52,6 +52,22 @@ ODIR_CLASS_DISPLAY = {
     "O": "other_abnormalities",
 }
 
+APTOS_CLASS_DISPLAY = {
+    0: "no_diabetic_retinopathy",
+    1: "mild_diabetic_retinopathy",
+    2: "moderate_diabetic_retinopathy",
+    3: "severe_diabetic_retinopathy",
+    4: "proliferative_diabetic_retinopathy",
+}
+
+DATASET_KEY_ALIASES = {
+    "odir5k": "odir-5k",
+    "aptos": "aptos-2019-blindness-detection",
+    "aptos2019": "aptos-2019-blindness-detection",
+    "aptos-2019": "aptos-2019-blindness-detection",
+    "aptos-2019-blindness": "aptos-2019-blindness-detection",
+}
+
 
 # 用于蒸馏的数据集划分
 @dataclass(frozen=True)
@@ -186,6 +202,27 @@ class ODIR5KSplit:
         self.labels = np.asarray(labels).reshape(-1).astype(np.int64, copy=False)
         if len(self.image_paths) != int(self.labels.shape[0]):
             raise ValueError("ODIR-5K split images/labels size mismatch.")
+
+    def __len__(self) -> int:
+        return int(len(self.image_paths))
+
+    def get_image_and_label(self, index: int) -> tuple[np.ndarray, int]:
+        idx = int(index)
+        image_path = self.image_paths[idx]
+        with Image.open(image_path) as pil_image:
+            image_np = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
+        return np.ascontiguousarray(image_np), int(self.labels[idx])
+
+    def get_all_labels(self) -> np.ndarray:
+        return self.labels
+
+
+class APTOS2019Split:
+    def __init__(self, image_paths: list[Path], labels: np.ndarray) -> None:
+        self.image_paths = [Path(p) for p in image_paths]
+        self.labels = np.asarray(labels).reshape(-1).astype(np.int64, copy=False)
+        if len(self.image_paths) != int(self.labels.shape[0]):
+            raise ValueError("APTOS-2019 split images/labels size mismatch.")
 
     def __len__(self) -> int:
         return int(len(self.image_paths))
@@ -715,6 +752,182 @@ class ODIR5KSpec(BaseDatasetSpec):
         )
 
 
+class APTOS2019BlindnessDetectionSpec(BaseDatasetSpec):
+    name = "aptos-2019-blindness-detection"
+    prompt_prefix = "retinal fundus image showing"
+
+    def _class_names(self) -> dict[int, str]:
+        return dict(APTOS_CLASS_DISPLAY)
+
+    def _resolve_dataset_root(self, data_root: str) -> Path:
+        base = Path(data_root)
+
+        candidates = [
+            base,
+            base / "APTOS_2019_Blindness_Detection",
+            base / "aptos_2019_blindness_detection",
+            base / "aptos-2019-blindness-detection",
+        ]
+
+        for candidate in candidates:
+            if (candidate / "train.csv").exists() and (candidate / "train_images").exists():
+                return candidate
+
+        raise FileNotFoundError(
+            "APTOS-2019 dataset root not found. Expected train.csv and train_images under one of: "
+            f"{[str(p) for p in candidates]}"
+        )
+
+    @staticmethod
+    def _resolve_image_path(train_image_root: Path, image_id: str) -> Path | None:
+        stem = str(image_id).strip()
+        if not stem:
+            return None
+
+        png_path = train_image_root / f"{stem}.png"
+        if png_path.exists():
+            return png_path
+
+        jpg_path = train_image_root / f"{stem}.jpg"
+        if jpg_path.exists():
+            return jpg_path
+
+        jpeg_path = train_image_root / f"{stem}.jpeg"
+        if jpeg_path.exists():
+            return jpeg_path
+
+        return None
+
+    def _load_samples(self, data_root: str) -> tuple[list[Path], np.ndarray]:
+        dataset_root = self._resolve_dataset_root(data_root)
+        csv_path = dataset_root / "train.csv"
+        train_image_root = dataset_root / "train_images"
+
+        image_paths: list[Path] = []
+        labels: list[int] = []
+        skipped_bad_label = 0
+        skipped_no_image = 0
+
+        with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                image_id = str(row.get("id_code", "")).strip()
+
+                raw_label = row.get("diagnosis")
+                try:
+                    label = int(raw_label)
+                except (TypeError, ValueError):
+                    skipped_bad_label += 1
+                    continue
+
+                if label not in APTOS_CLASS_DISPLAY:
+                    skipped_bad_label += 1
+                    continue
+
+                image_path = self._resolve_image_path(train_image_root, image_id)
+                if image_path is None:
+                    skipped_no_image += 1
+                    continue
+
+                image_paths.append(image_path)
+                labels.append(label)
+
+        if not image_paths:
+            raise RuntimeError(f"No usable APTOS-2019 samples found from {csv_path}")
+
+        if skipped_bad_label > 0 or skipped_no_image > 0:
+            warnings.warn(
+                "APTOS-2019 dropped rows during parsing: "
+                f"bad_label={skipped_bad_label}, no_image={skipped_no_image}",
+                RuntimeWarning,
+            )
+
+        return image_paths, np.asarray(labels, dtype=np.int64)
+
+    def _build_splits(self, data_root: str) -> tuple[APTOS2019Split, APTOS2019Split, APTOS2019Split]:
+        image_paths, labels = self._load_samples(data_root)
+        indices = np.arange(labels.shape[0], dtype=np.int64)
+
+        try:
+            train_idx, tail_idx = train_test_split(
+                indices,
+                test_size=0.2,
+                random_state=42,
+                shuffle=True,
+                stratify=labels,
+            )
+            tail_labels = labels[tail_idx]
+            val_idx, test_idx = train_test_split(
+                tail_idx,
+                test_size=0.5,
+                random_state=42,
+                shuffle=True,
+                stratify=tail_labels,
+            )
+        except ValueError:
+            warnings.warn(
+                "APTOS-2019 stratified split failed, fallback to random split.",
+                RuntimeWarning,
+            )
+            train_idx, tail_idx = train_test_split(
+                indices,
+                test_size=0.2,
+                random_state=42,
+                shuffle=True,
+                stratify=None,
+            )
+            val_idx, test_idx = train_test_split(
+                tail_idx,
+                test_size=0.5,
+                random_state=42,
+                shuffle=True,
+                stratify=None,
+            )
+
+        train_split = APTOS2019Split([image_paths[int(i)] for i in train_idx], labels[train_idx])
+        val_split = APTOS2019Split([image_paths[int(i)] for i in val_idx], labels[val_idx])
+        test_split = APTOS2019Split([image_paths[int(i)] for i in test_idx], labels[test_idx])
+        return train_split, val_split, test_split
+
+    @override
+    def class_names(self, data_root: str = "data", image_size: int = 224) -> dict[int, str]:
+        return self._class_names()
+
+    @override
+    def load_lora_train_split(self, data_root: str, image_size: int) -> tuple[Any, dict[int, str]]:
+        train_set, _, _ = self._build_splits(data_root=data_root)
+        return train_set, self._class_names()
+
+    @override
+    def load_distillation_splits(self, data_root: str, image_size: int) -> DistillationSplits:
+        train_set, val_set, test_set = self._build_splits(data_root=data_root)
+        class_names = self._class_names()
+        return DistillationSplits(
+            train_set=train_set,
+            val_set=val_set,
+            test_set=test_set,
+            num_classes=len(class_names),
+            class_names=class_names,
+        )
+
+    @override
+    def load_student_eval_splits(self, data_root: str, image_size: int) -> StudentEvalSplits:
+        _, val_set, test_set = self._build_splits(data_root=data_root)
+        class_names = self._class_names()
+        ordered_names = [class_names[i] for i in range(len(class_names))]
+        return StudentEvalSplits(
+            val_set=val_set,
+            test_set=test_set,
+            num_classes=len(class_names),
+            class_names=ordered_names,
+        )
+
+
+def normalize_dataset_key(dataset: str) -> str:
+    key = str(dataset).strip().lower().replace("_", "-")
+    return DATASET_KEY_ALIASES.get(key, key)
+
+
 def _iter_spec_classes() -> list[type[BaseDatasetSpec]]:
     pending = list(BaseDatasetSpec.__subclasses__())
     all_classes: list[type[BaseDatasetSpec]] = []
@@ -744,7 +957,7 @@ def supported_datasets() -> tuple[str, ...]:
 
 
 def get_dataset_spec(dataset: str) -> BaseDatasetSpec:
-    key = dataset.lower().strip()
+    key = normalize_dataset_key(dataset)
     registry = _build_registry()
     if key not in registry:
         supported = ", ".join(sorted(registry.keys()))

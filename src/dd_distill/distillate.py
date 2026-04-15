@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
 
 from .baseline_resnet18 import load_teacher_checkpoint, train_teacher_baseline
-from .datasets import MedMNISTImageDataset, get_dataset_spec, supported_datasets
+from .datasets import MedMNISTImageDataset, get_dataset_spec, normalize_dataset_key, supported_datasets
 from .utils import *
 
 
@@ -787,7 +787,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Dataset distillation: teacher training + VAE encode + class-wise CLVQ + reverse-SDE decode"
     )
-    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--dataset", type=normalize_dataset_key, default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--teacher-baseline-dir", type=str, default="")

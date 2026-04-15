@@ -21,14 +21,11 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from .datasets import get_dataset_spec, supported_datasets
+from .datasets import get_dataset_spec, normalize_dataset_key, supported_datasets
 
 
 def normalize_dataset_name(dataset: str) -> str:
-    key = str(dataset).strip().lower().replace("_", "-")
-    if key == "odir5k":
-        return "odir-5k"
-    return key
+    return normalize_dataset_key(dataset)
 
 
 def set_seed(seed: int) -> None:

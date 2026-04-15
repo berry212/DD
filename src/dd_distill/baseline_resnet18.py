@@ -17,7 +17,7 @@ from tqdm import tqdm
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
 
-from .datasets import MedMNISTImageDataset, get_dataset_spec, supported_datasets
+from .datasets import MedMNISTImageDataset, get_dataset_spec, normalize_dataset_key, supported_datasets
 from .utils import *
 
 
@@ -418,7 +418,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(DermaMNIST, BloodMNIST, NIH Chest X-ray14, ODIR-5K)."
         )
     )
-    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--dataset", type=normalize_dataset_key, default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--output-dir", type=str, default="")
 
