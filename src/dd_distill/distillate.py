@@ -637,7 +637,9 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             baseline_dir=teacher_baseline_dir,
         )
 
-    latent_cache_path = output_dir / "train_latents.pt"
+    # Latents are independent of IPC, so cache them under dataset baseline dir.
+    latent_cache_path = teacher_baseline_dir / "train_latents.pt"
+    legacy_latent_cache_path = output_dir / "train_latents.pt"
     vae_dtype = torch.float16 if amp_enabled else torch.float32
     vae, scaling_factor = load_vae(args.vae_model_id, device=device, dtype=vae_dtype)
 
@@ -648,6 +650,29 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         expected_vae_model_id=args.vae_model_id,
         expected_image_size=args.image_size,
     )
+
+    latent_source = "cache"
+    if cached_latents is None and legacy_latent_cache_path != latent_cache_path:
+        legacy_cached_latents = load_latent_cache(
+            cache_path=legacy_latent_cache_path,
+            expected_num_samples=len(train_set),
+            expected_dataset=dataset_spec.name,
+            expected_vae_model_id=args.vae_model_id,
+            expected_image_size=args.image_size,
+        )
+        if legacy_cached_latents is not None:
+            latents, latent_labels = legacy_cached_latents
+            save_latent_cache(
+                cache_path=latent_cache_path,
+                latents=latents,
+                labels=latent_labels,
+                dataset_name=dataset_spec.name,
+                vae_model_id=args.vae_model_id,
+                image_size=args.image_size,
+            )
+            cached_latents = (latents, latent_labels)
+            latent_source = "legacy_cache"
+
     if cached_latents is None:
         encode_loader = build_encode_loader(
             train_set=train_set,
@@ -674,7 +699,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         latent_source = "vae_encoder"
     else:
         latents, latent_labels = cached_latents
-        latent_source = "cache"
 
     clvq = classwise_clvq(
         latents=latents,
