@@ -15,6 +15,7 @@ from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader
+from torchvision import transforms
 from torchvision.utils import make_grid
 
 from .baseline_resnet18 import load_teacher_checkpoint, train_teacher_baseline
@@ -54,12 +55,21 @@ def make_teacher_soft_labels(
 
 def build_encode_loader(
     train_set: Any,
+    image_size: int,
     encode_batch_size: int,
     num_workers: int,
     device: torch.device,
 ) -> DataLoader[tuple[torch.Tensor, torch.Tensor]]:
+    encode_transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ]
+    )
+
     return DataLoader(
-        MedMNISTImageDataset(train_set, transform=None),
+        MedMNISTImageDataset(train_set, transform=encode_transform),
         batch_size=encode_batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -676,6 +686,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     if cached_latents is None:
         encode_loader = build_encode_loader(
             train_set=train_set,
+            image_size=args.image_size,
             encode_batch_size=args.encode_batch_size,
             num_workers=args.num_workers,
             device=device,
