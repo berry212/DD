@@ -105,6 +105,91 @@ def encode_training_images(
     return torch.cat(all_latents, dim=0), torch.cat(all_labels, dim=0)
 
 
+def save_latent_cache(
+    cache_path: Path,
+    latents: torch.Tensor,
+    labels: torch.Tensor,
+    dataset_name: str,
+    vae_model_id: str,
+    image_size: int,
+) -> None:
+    torch.save(
+        {
+            "latents": latents.float().cpu(),
+            "labels": labels.long().cpu(),
+            "dataset": dataset_name,
+            "vae_model_id": vae_model_id,
+            "image_size": int(image_size),
+        },
+        cache_path,
+    )
+    print(f"[Encoding] Saved latent cache: {cache_path}")
+
+
+def load_latent_cache(
+    cache_path: Path,
+    expected_num_samples: int,
+    expected_dataset: str,
+    expected_vae_model_id: str,
+    expected_image_size: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = torch.load(cache_path, map_location="cpu")
+    except Exception as exc:
+        warnings.warn(f"Failed to load latent cache ({cache_path}): {exc}", RuntimeWarning)
+        return None
+
+    if not isinstance(payload, dict):
+        warnings.warn(f"Latent cache format invalid: {cache_path}", RuntimeWarning)
+        return None
+
+    cached_dataset = payload.get("dataset")
+    if cached_dataset is not None and str(cached_dataset) != str(expected_dataset):
+        warnings.warn(
+            f"Latent cache dataset mismatch ({cached_dataset} != {expected_dataset}), re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    cached_model_id = payload.get("vae_model_id")
+    if cached_model_id is not None and str(cached_model_id) != str(expected_vae_model_id):
+        warnings.warn(
+            f"Latent cache VAE mismatch ({cached_model_id} != {expected_vae_model_id}), re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    cached_image_size = payload.get("image_size")
+    if cached_image_size is not None and int(cached_image_size) != int(expected_image_size):
+        warnings.warn(
+            f"Latent cache image size mismatch ({cached_image_size} != {expected_image_size}), re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    latents = payload.get("latents")
+    labels = payload.get("labels")
+    if not isinstance(latents, torch.Tensor) or not isinstance(labels, torch.Tensor):
+        warnings.warn(f"Latent cache missing tensor fields: {cache_path}", RuntimeWarning)
+        return None
+
+    latents = latents.float().cpu()
+    labels = labels.long().view(-1).cpu()
+    if latents.size(0) != expected_num_samples or labels.size(0) != expected_num_samples:
+        warnings.warn(
+            f"Latent cache sample count mismatch ({latents.size(0)}/{labels.size(0)} != {expected_num_samples}), "
+            "re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    print(f"[Encoding] Loaded latent cache: {cache_path}")
+    return latents, labels
+
+
 def initialize_clvq_centers(data: np.ndarray, num_centers: int, seed: int) -> np.ndarray:
     if num_centers <= 0:
         raise ValueError("num_centers must be positive.")
@@ -504,23 +589,44 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             baseline_dir=teacher_baseline_dir,
         )
 
-    encode_loader = build_encode_loader(
-        train_set=train_set,
-        encode_batch_size=args.encode_batch_size,
-        num_workers=args.num_workers,
-        device=device,
-    )
-
+    latent_cache_path = output_dir / "train_latents.pt"
     vae_dtype = torch.float16 if amp_enabled else torch.float32
     vae, scaling_factor = load_vae(args.vae_model_id, device=device, dtype=vae_dtype)
 
-    latents, latent_labels = encode_training_images(
-        vae=vae,
-        data_loader=encode_loader,
-        scaling_factor=scaling_factor,
-        device=device,
-        dtype=vae_dtype,
+    cached_latents = load_latent_cache(
+        cache_path=latent_cache_path,
+        expected_num_samples=len(train_set),
+        expected_dataset=dataset_spec.name,
+        expected_vae_model_id=args.vae_model_id,
+        expected_image_size=args.image_size,
     )
+    if cached_latents is None:
+        encode_loader = build_encode_loader(
+            train_set=train_set,
+            encode_batch_size=args.encode_batch_size,
+            num_workers=args.num_workers,
+            device=device,
+        )
+
+        latents, latent_labels = encode_training_images(
+            vae=vae,
+            data_loader=encode_loader,
+            scaling_factor=scaling_factor,
+            device=device,
+            dtype=vae_dtype,
+        )
+        save_latent_cache(
+            cache_path=latent_cache_path,
+            latents=latents,
+            labels=latent_labels,
+            dataset_name=dataset_spec.name,
+            vae_model_id=args.vae_model_id,
+            image_size=args.image_size,
+        )
+        latent_source = "vae_encoder"
+    else:
+        latents, latent_labels = cached_latents
+        latent_source = "cache"
 
     clvq = classwise_clvq(
         latents=latents,
@@ -592,6 +698,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
         "lora_path": resolved_lora_path,
+        "latent_cache_path": str(latent_cache_path),
+        "latent_source": latent_source,
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
