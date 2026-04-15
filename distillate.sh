@@ -16,6 +16,32 @@ TEACHER_BACKBONE="${TEACHER_BACKBONE:-resnet50}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_distill_ipc${IPC}}"
 BASELINE_DIR="${BASELINE_DIR:-outputs/${DATASET}_224_distill_baseline}"
+GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.0}"
+SDE_STEPS="${SDE_STEPS:-200}"
+
+if [[ -z "${TEACHER_TEMPERATURE:-}" ]]; then
+  if [[ "$DATASET" == "dermamnist" ]]; then
+    TEACHER_TEMPERATURE="8.0"
+  else
+    TEACHER_TEMPERATURE="20.0"
+  fi
+fi
+
+if [[ -z "${SDE_NOISE_STRENGTH:-}" ]]; then
+  if [[ "$DATASET" == "dermamnist" ]]; then
+    SDE_NOISE_STRENGTH="0.1"
+  else
+    SDE_NOISE_STRENGTH="0.2"
+  fi
+fi
+
+if [[ -z "${CLVQ_MEDOID_ANCHOR:-}" ]]; then
+  if [[ "$DATASET" == "dermamnist" ]]; then
+    CLVQ_MEDOID_ANCHOR="0.65"
+  else
+    CLVQ_MEDOID_ANCHOR="0.0"
+  fi
+fi
 
 if [[ ! -d "$LORA_PATH" ]]; then
   echo "[WARN] LoRA path not found: $LORA_PATH"
@@ -31,14 +57,16 @@ uv run run-distillation \
   --diffusion-model-id runwayml/stable-diffusion-v1-5 \
   --lora-path "$LORA_PATH" \
   --lora-scale 0.9 \
-  --guidance-scale 3.0 \
+  --guidance-scale "$GUIDANCE_SCALE" \
   --clusters-per-class "$IPC" \
+  --clvq-medoid-anchor "$CLVQ_MEDOID_ANCHOR" \
   --teacher-backbone "$TEACHER_BACKBONE" \
   --teacher-epochs "$TEACHER_EPOCHS" \
-  --sde-steps 200 \
-  --sde-noise-strength 0.2 \
-  --encode-batch-size 4 \
-  --decode-batch-size 4 \
+  --teacher-temperature "$TEACHER_TEMPERATURE" \
+  --sde-steps "$SDE_STEPS" \
+  --sde-noise-strength "$SDE_NOISE_STRENGTH" \
+  --encode-batch-size 32 \
+  --decode-batch-size 32 \
   --fp16 \
   "$@"
 

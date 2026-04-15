@@ -220,6 +220,41 @@ def assign_to_centers(data: np.ndarray, centers: np.ndarray, batch_size: int = 2
     return assignments
 
 
+def anchor_centers_to_medoids(
+    data: np.ndarray,
+    centers: np.ndarray,
+    anchor: float,
+    batch_size: int = 2048,
+) -> np.ndarray:
+    if data.size == 0 or centers.size == 0:
+        raise ValueError("anchor_centers_to_medoids expects non-empty data and centers.")
+
+    alpha = float(np.clip(anchor, 0.0, 1.0))
+    if alpha <= 0.0:
+        return centers
+
+    center_norm = np.sum(centers * centers, axis=1)
+    best_dist = np.full((centers.shape[0],), fill_value=np.inf, dtype=np.float64)
+    best_samples = centers.copy()
+
+    for start in range(0, data.shape[0], batch_size):
+        end = min(data.shape[0], start + batch_size)
+        chunk = data[start:end]
+        chunk_norm = np.sum(chunk * chunk, axis=1, keepdims=True)
+        distances = chunk_norm + center_norm[None, :] - 2.0 * (chunk @ centers.T)
+
+        winner_rows = np.argmin(distances, axis=0)
+        winner_dist = distances[winner_rows, np.arange(centers.shape[0])]
+        improved = winner_dist < best_dist
+
+        if np.any(improved):
+            best_dist[improved] = winner_dist[improved]
+            best_samples[improved] = chunk[winner_rows[improved]]
+
+    anchored = (1.0 - alpha) * centers + alpha * best_samples
+    return anchored.astype(np.float32, copy=False)
+
+
 def classwise_clvq(
     latents: torch.Tensor,
     labels: torch.Tensor,
@@ -231,9 +266,12 @@ def classwise_clvq(
     max_iter: int,
     tol: float,
     check_interval: int,
+    medoid_anchor: float,
 ) -> CLVQResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
+
+    medoid_anchor = float(np.clip(medoid_anchor, 0.0, 1.0))
 
     flat_latents = latents.view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
     labels_np = labels.numpy().astype(np.int64, copy=False)
@@ -282,6 +320,16 @@ def classwise_clvq(
                 prev_centers = centers.copy()
 
         assignments = assign_to_centers(class_latents, centers, batch_size=2048)
+
+        if medoid_anchor > 0.0:
+            centers = anchor_centers_to_medoids(
+                data=class_latents,
+                centers=centers,
+                anchor=medoid_anchor,
+                batch_size=2048,
+            )
+            assignments = assign_to_centers(class_latents, centers, batch_size=2048)
+
         counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
 
         non_empty_mask = counts > 0
@@ -300,7 +348,7 @@ def classwise_clvq(
 
         print(
             f"[CLVQ-Class] class={class_id} samples={class_samples} "
-            f"kept={centers.shape[0]}"
+            f"kept={centers.shape[0]} medoid_anchor={medoid_anchor:.2f}"
         )
 
     if not center_chunks:
@@ -639,6 +687,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         max_iter=args.clvq_max_iter,
         tol=args.clvq_tol,
         check_interval=args.clvq_check_interval,
+        medoid_anchor=args.clvq_medoid_anchor,
     )
 
     class_prompts = dataset_spec.build_class_prompts(class_names)
@@ -694,6 +743,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "num_classes": int(num_classes),
         "clvq_mode": "class-wise",
         "clusters_per_class": int(args.clusters_per_class),
+        "clvq_medoid_anchor": float(args.clvq_medoid_anchor),
         "num_distilled": int(distilled_images.size(0)),
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
@@ -724,6 +774,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clvq-max-iter", type=int, default=10000)
     parser.add_argument("--clvq-tol", type=float, default=1e-5)
     parser.add_argument("--clvq-check-interval", type=int, default=500)
+    parser.add_argument("--clvq-medoid-anchor", type=float, default=0.0)
 
     parser.add_argument("--encode-batch-size", type=int, default=64)
     parser.add_argument("--decode-batch-size", type=int, default=32)

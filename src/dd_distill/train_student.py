@@ -172,6 +172,43 @@ def load_distilled_triplet(
     return images, weights, soft_labels, distilled_dataset, distilled_lora_path
 
 
+def sharpen_soft_labels(soft_labels: torch.Tensor, temperature: float) -> torch.Tensor:
+    t = float(max(temperature, 1e-6))
+    if abs(t - 1.0) < 1e-8:
+        return soft_labels
+
+    logits = torch.log(soft_labels.clamp_min(1e-12))
+    sharpened = F.softmax(logits / t, dim=1)
+    return sharpened
+
+
+def blend_sample_weights(
+    weights: torch.Tensor,
+    hard_labels: torch.Tensor,
+    num_classes: int,
+    balance_alpha: float,
+) -> torch.Tensor:
+    alpha = float(np.clip(balance_alpha, 0.0, 1.0))
+    base = weights.clamp_min(0.0)
+    base = base / base.sum().clamp_min(1e-12)
+
+    if alpha <= 0.0:
+        return base
+
+    class_counts = torch.bincount(hard_labels.long(), minlength=num_classes).float()
+    class_counts = class_counts.clamp_min(0.0)
+    present = class_counts > 0
+    inv = torch.zeros_like(class_counts)
+    inv[present] = 1.0 / class_counts[present]
+
+    balanced = inv[hard_labels.long()]
+    balanced = balanced / balanced.sum().clamp_min(1e-12)
+
+    mixed = (1.0 - alpha) * base + alpha * balanced
+    mixed = mixed / mixed.sum().clamp_min(1e-12)
+    return mixed
+
+
 def build_classifier(
     num_classes: int,
     imagenet_pretrained: bool,
@@ -254,6 +291,8 @@ def train_student(
     device: torch.device,
     amp_enabled: bool,
     output_dir: Path,
+    kd_temperature: float,
+    hard_label_alpha: float,
 ) -> dict[str, Any]:
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(epochs, 1))
@@ -266,8 +305,13 @@ def train_student(
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
+        epoch_soft_loss = 0.0
+        epoch_hard_loss = 0.0
         epoch_correct = 0
         epoch_samples = 0
+
+        temp = float(max(kd_temperature, 1e-6))
+        hard_alpha = float(np.clip(hard_label_alpha, 0.0, 1.0))
 
         for images, soft_labels, hard_labels, sample_weights in train_loader:
             images = images.to(device)
@@ -278,18 +322,29 @@ def train_student(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 logits = model(images)
-                per_sample_soft_ce = -(soft_labels * F.log_softmax(logits.float(), dim=1)).sum(dim=1)
-                loss = (per_sample_soft_ce * sample_weights).sum() / (sample_weights.sum() + 1e-12)
+                student_log_probs = F.log_softmax(logits.float() / temp, dim=1)
+                per_sample_soft_ce = -(soft_labels * student_log_probs).sum(dim=1)
+                soft_loss = (per_sample_soft_ce * sample_weights).sum() / (sample_weights.sum() + 1e-12)
+                soft_loss = soft_loss * (temp * temp)
+
+                per_sample_hard_ce = F.cross_entropy(logits.float(), hard_labels, reduction="none")
+                hard_loss = (per_sample_hard_ce * sample_weights).sum() / (sample_weights.sum() + 1e-12)
+
+                loss = (1.0 - hard_alpha) * soft_loss + hard_alpha * hard_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             epoch_loss += float(loss.item()) * images.size(0)
+            epoch_soft_loss += float(soft_loss.item()) * images.size(0)
+            epoch_hard_loss += float(hard_loss.item()) * images.size(0)
             epoch_correct += int((logits.argmax(dim=1) == hard_labels).sum().item())
             epoch_samples += images.size(0)
 
         train_loss = epoch_loss / max(epoch_samples, 1)
+        train_soft_loss = epoch_soft_loss / max(epoch_samples, 1)
+        train_hard_loss = epoch_hard_loss / max(epoch_samples, 1)
         train_acc = epoch_correct / max(epoch_samples, 1)
         val_loss, val_acc = evaluate_classifier(model, val_loader, device, amp_enabled=amp_enabled)
         test_loss, test_acc = evaluate_classifier(model, test_loader, device, amp_enabled=amp_enabled)
@@ -299,6 +354,8 @@ def train_student(
             {
                 "epoch": float(epoch),
                 "train_loss": train_loss,
+                "train_soft_loss": train_soft_loss,
+                "train_hard_loss": train_hard_loss,
                 "train_acc": train_acc,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
@@ -371,6 +428,16 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         distilled_data_path,
         num_classes,
     )
+
+    soft_labels = sharpen_soft_labels(soft_labels, temperature=args.soft_label_sharpen)
+    hard_labels = torch.argmax(soft_labels, dim=1).long()
+    weights = blend_sample_weights(
+        weights=weights,
+        hard_labels=hard_labels,
+        num_classes=num_classes,
+        balance_alpha=args.weight_balance_alpha,
+    )
+
     if distilled_dataset and distilled_dataset != dataset_spec.name:
         raise ValueError(
             "Distilled data dataset mismatch: "
@@ -422,6 +489,8 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         device=device,
         amp_enabled=amp_enabled,
         output_dir=output_dir,
+        kd_temperature=args.kd_temperature,
+        hard_label_alpha=args.hard_label_alpha,
     )
 
     best_ckpt = torch.load(output_dir / "student_best.pt", map_location=device)
@@ -454,6 +523,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "distilled_lora_path": distilled_lora_path,
         "student_backbone": str(args.student_backbone),
         "amp_enabled": bool(amp_enabled),
+        "kd_temperature": float(args.kd_temperature),
+        "hard_label_alpha": float(args.hard_label_alpha),
+        "weight_balance_alpha": float(args.weight_balance_alpha),
+        "soft_label_sharpen": float(args.soft_label_sharpen),
         "best_epoch": int(training_summary["best_epoch"]),
         "best_val_acc": float(training_summary["best_val_acc"]),
         "test_acc_at_best_val": float(training_summary["test_acc_at_best_val"]),
@@ -485,6 +558,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--train-lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--kd-temperature", type=float, default=1.0)
+    parser.add_argument("--hard-label-alpha", type=float, default=0.0)
+    parser.add_argument("--weight-balance-alpha", type=float, default=0.0)
+    parser.add_argument("--soft-label-sharpen", type=float, default=1.0)
 
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--imagenet-pretrained", action=argparse.BooleanOptionalAction, default=True)
