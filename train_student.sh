@@ -31,7 +31,11 @@ fi
 
 if [[ -z "${KD_TEMPERATURE:-}" ]]; then
   if [[ "$DATASET" == "dermamnist" ]]; then
-    KD_TEMPERATURE="2.0"
+    if [[ "$IPC" -le 100 ]]; then
+      KD_TEMPERATURE="1.5"
+    else
+      KD_TEMPERATURE="2.0"
+    fi
   else
     KD_TEMPERATURE="1.0"
   fi
@@ -55,7 +59,11 @@ fi
 
 if [[ -z "${SOFT_LABEL_SHARPEN:-}" ]]; then
   if [[ "$DATASET" == "dermamnist" ]]; then
-    SOFT_LABEL_SHARPEN="0.85"
+    if [[ "$IPC" -le 100 ]]; then
+      SOFT_LABEL_SHARPEN="0.9"
+    else
+      SOFT_LABEL_SHARPEN="0.85"
+    fi
   else
     SOFT_LABEL_SHARPEN="1.0"
   fi

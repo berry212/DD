@@ -51,6 +51,40 @@ if [[ -z "${CLVQ_MEDOID_ANCHOR:-}" ]]; then
   fi
 fi
 
+if [[ -z "${INFLUENCE_MODE:-}" ]]; then
+  INFLUENCE_MODE="image-grad"
+fi
+
+if [[ -z "${INFLUENCE_BLEND_BETA:-}" ]]; then
+  if [[ "$DATASET" == "dermamnist" ]]; then
+    if [[ "$IPC" -le 100 ]]; then
+      INFLUENCE_BLEND_BETA="0.35"
+    else
+      INFLUENCE_BLEND_BETA="0.35"
+    fi
+  else
+    INFLUENCE_BLEND_BETA="0.20"
+  fi
+fi
+
+if [[ -z "${WEIGHT_COUNT_POWER:-}" ]]; then
+  if [[ "$DATASET" == "dermamnist" ]]; then
+    if [[ "$IPC" -le 100 ]]; then
+      WEIGHT_COUNT_POWER="0.4"
+    else
+      WEIGHT_COUNT_POWER="0.5"
+    fi
+  else
+    WEIGHT_COUNT_POWER="0.7"
+  fi
+fi
+
+WEIGHT_INFLUENCE_POWER="${WEIGHT_INFLUENCE_POWER:-1.5}"
+
+INFLUENCE_QUANTILE="${INFLUENCE_QUANTILE:-0.85}"
+INFLUENCE_MIN_VALUE="${INFLUENCE_MIN_VALUE:-1e-3}"
+INFLUENCE_MAX_VALUE="${INFLUENCE_MAX_VALUE:-1.0}"
+
 if [[ ! -d "$LORA_PATH" ]]; then
   echo "[WARN] LoRA path not found: $LORA_PATH"
   echo "[WARN] Please run: bash lora_finetune.sh"
@@ -80,6 +114,13 @@ uv run run-distillation \
   --guidance-scale "$GUIDANCE_SCALE" \
   --clusters-per-class "$IPC" \
   --clvq-medoid-anchor "$CLVQ_MEDOID_ANCHOR" \
+  --influence-mode "$INFLUENCE_MODE" \
+  --influence-blend-beta "$INFLUENCE_BLEND_BETA" \
+  --weight-count-power "$WEIGHT_COUNT_POWER" \
+  --weight-influence-power "$WEIGHT_INFLUENCE_POWER" \
+  --influence-quantile "$INFLUENCE_QUANTILE" \
+  --influence-min-value "$INFLUENCE_MIN_VALUE" \
+  --influence-max-value "$INFLUENCE_MAX_VALUE" \
   --teacher-backbone "$TEACHER_BACKBONE" \
   --teacher-epochs "$TEACHER_EPOCHS" \
   --teacher-temperature "$TEACHER_TEMPERATURE" \
