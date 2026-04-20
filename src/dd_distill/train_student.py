@@ -10,55 +10,50 @@ from typing import Any, override
 import numpy as np
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import classification_report, confusion_matrix
+import timm
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, roc_auc_score
+from timm.data import resolve_model_data_config
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
 
-from .datasets import MedMNISTImageDataset, get_dataset_spec, normalize_dataset_key, supported_datasets
+from .datasets import DistilledTripletDataset, TorchDataset, get_dataset_spec, supported_datasets
+from .utils import *
 
 
-IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(3, 1, 1)
-IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(3, 1, 1)
+SUPPORTED_BACKBONES = ("resnet18", "resnet50", "vit_tiny_patch16_224")
+BACKBONE_ALIASES = {
+    "resnet18": "resnet18",
+    "resnet50": "resnet50",
+    "vit": "vit_tiny_patch16_224",
+    "vit_tiny": "vit_tiny_patch16_224",
+    "vit-tiny": "vit_tiny_patch16_224",
+    "vit_tiny_patch16_224": "vit_tiny_patch16_224",
+}
 
 
-class DistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
-    def __init__(
-        self,
-        images: torch.Tensor,
-        weights: torch.Tensor,
-        soft_labels: torch.Tensor,
-        transform: transforms.Compose,
-    ) -> None:
-        super().__init__()
-        self.images = images.float().cpu()
-        self.weights = weights.float().cpu()
-        self.soft_labels = soft_labels.float().cpu()
-        self.hard_labels = torch.argmax(self.soft_labels, dim=1).long()
-        self.transform = transform
-
-    @override
-    def __len__(self) -> int:
-        return int(self.images.size(0))
-
-    @override
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        image = self.transform(self.images[index])
-        soft = self.soft_labels[index]
-        hard = self.hard_labels[index]
-        weight = self.weights[index]
-        return image, soft, hard, weight
+def normalize_backbone_name(name: str) -> str:
+    key = str(name).strip().lower().replace("-", "_")
+    return BACKBONE_ALIASES.get(key, key)
 
 
-def set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def resolve_backbone_normalization(backbone: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    backbone_name = normalize_backbone_name(backbone)
+    if backbone_name != "vit_tiny_patch16_224":
+        return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+
+    # ViT models in timm can define their own data config. Use it for normalization.
+    vit_probe = timm.create_model(backbone_name, pretrained=False, num_classes=1)
+    try:
+        data_config = resolve_model_data_config(vit_probe)
+    finally:
+        del vit_probe
+
+    mean = tuple(float(v) for v in data_config.get("mean", (0.5, 0.5, 0.5)))
+    std = tuple(float(v) for v in data_config.get("std", (0.5, 0.5, 0.5)))
+    return mean, std
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -71,17 +66,14 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def default_data_root() -> str:
-    return os.getenv("HF_DATASETS_CACHE") or os.getenv("HF_HOME", "data")
-
-
-def build_eval_transform(image_size: int) -> transforms.Compose:
+def build_eval_transform(image_size: int, backbone: str) -> transforms.Compose:
+    mean, std = resolve_backbone_normalization(backbone)
     return transforms.Compose(
         [
             transforms.ToPILImage(),
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            transforms.Normalize(mean=mean, std=std),
         ]
     )
 
@@ -96,14 +88,14 @@ def build_eval_loaders(
 ) -> tuple[DataLoader[tuple[torch.Tensor, torch.Tensor]], DataLoader[tuple[torch.Tensor, torch.Tensor]]]:
     pin_memory = device.type == "cuda"
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        MedMNISTImageDataset(val_set, transform=eval_transform),
+        TorchDataset(val_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        MedMNISTImageDataset(test_set, transform=eval_transform),
+        TorchDataset(test_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -113,8 +105,7 @@ def build_eval_loaders(
 
 
 def load_distilled_triplet(
-    distilled_data_path: Path,
-    num_classes: int,
+    distilled_data_path: Path
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str]:
     payload = torch.load(distilled_data_path, map_location="cpu")
 
@@ -133,10 +124,6 @@ def load_distilled_triplet(
         raise ValueError(f"images must be 4D (N,C,H,W), got {tuple(images.shape)}")
     if soft_labels.ndim != 2:
         raise ValueError(f"soft_labels must be 2D (N,C), got {tuple(soft_labels.shape)}")
-    if soft_labels.size(1) != num_classes:
-        raise ValueError(
-            f"soft_labels second dimension must be num_classes={num_classes}, got {soft_labels.size(1)}"
-        )
 
     n = images.size(0)
     if weights.numel() != n or soft_labels.size(0) != n:
@@ -214,15 +201,19 @@ def build_classifier(
     imagenet_pretrained: bool,
     backbone: str,
 ) -> nn.Module:
-    name = backbone.lower()
+    name = normalize_backbone_name(backbone)
     if name == "resnet18":
         weights = ResNet18_Weights.IMAGENET1K_V1 if imagenet_pretrained else None
         model = resnet18(weights=weights)
     elif name == "resnet50":
         weights = ResNet50_Weights.IMAGENET1K_V2 if imagenet_pretrained else None
         model = resnet50(weights=weights)
+    elif name == "vit_tiny_patch16_224":
+        # vit_tiny_patch16_224 is selected for 12GB GPUs as a practical ViT baseline.
+        model = timm.create_model(name, pretrained=imagenet_pretrained, num_classes=num_classes)
+        return model
     else:
-        raise ValueError(f"Unsupported backbone: {backbone}.")
+        raise ValueError(f"Unsupported backbone: {backbone}. choices={SUPPORTED_BACKBONES}")
 
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
@@ -256,7 +247,7 @@ def evaluate_classifier(
 
 
 @torch.no_grad()
-def predict_labels(
+def predict_probabilities(
     model: nn.Module,
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
@@ -264,20 +255,32 @@ def predict_labels(
 ) -> tuple[np.ndarray, np.ndarray]:
     model.eval()
     all_true: list[torch.Tensor] = []
-    all_pred: list[torch.Tensor] = []
+    all_prob: list[torch.Tensor] = []
 
     for images, labels in loader:
         images = images.to(device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             logits = model(images)
-        preds = logits.argmax(dim=1).cpu()
+        probs = F.softmax(logits.float(), dim=1)
 
         all_true.append(labels.cpu())
-        all_pred.append(preds)
+        all_prob.append(probs.cpu())
 
     y_true = torch.cat(all_true, dim=0).numpy()
-    y_pred = torch.cat(all_pred, dim=0).numpy()
-    return y_true, y_pred
+    y_prob = torch.cat(all_prob, dim=0).numpy()
+    return y_true, y_prob
+
+
+def compute_macro_auc(y_true: np.ndarray, y_prob: np.ndarray, num_classes: int) -> float | None:
+    class_counts = np.bincount(y_true, minlength=num_classes)
+    if int((class_counts > 0).sum()) < 2:
+        return None
+
+    y_true_one_hot = np.eye(num_classes, dtype=np.float32)[y_true]
+    try:
+        return float(roc_auc_score(y_true_one_hot, y_prob, multi_class="ovr", average="macro"))
+    except ValueError:
+        return None
 
 
 def train_student(
@@ -419,14 +422,14 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
         json.dump(run_config, handle, indent=2)
 
-    eval_bundle = dataset_spec.load_student_eval_splits(data_root=args.data_root, image_size=args.image_size)
-    val_set = eval_bundle.val_set
-    test_set = eval_bundle.test_set
-    num_classes = eval_bundle.num_classes
-    class_names = eval_bundle.class_names
+    split_bundle = dataset_spec.load_dataset_splits(data_root=args.data_root, image_size=args.image_size)
+    val_set = split_bundle.val_set
+    test_set = split_bundle.test_set
+    num_classes = split_bundle.num_classes
+    class_name_map = split_bundle.class_names
+    class_names = [class_name_map.get(idx, f"class_{idx}") for idx in range(num_classes)]
     images, weights, soft_labels, distilled_dataset, distilled_lora_path = load_distilled_triplet(
         distilled_data_path,
-        num_classes,
     )
 
     soft_labels = sharpen_soft_labels(soft_labels, temperature=args.soft_label_sharpen)
@@ -448,7 +451,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         f"weights_sum={weights.sum().item():.6f} soft_shape={tuple(soft_labels.shape)}"
     )
 
-    eval_transform = build_eval_transform(args.image_size)
+    eval_transform = build_eval_transform(args.image_size, backbone=args.student_backbone)
     val_loader, test_loader = build_eval_loaders(
         val_set=val_set,
         test_set=test_set,
@@ -497,7 +500,11 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     model.load_state_dict(best_ckpt["model"])
     model.eval()
 
-    y_true, y_pred = predict_labels(model, test_loader, device, amp_enabled=amp_enabled)
+    y_true, y_prob = predict_probabilities(model, test_loader, device, amp_enabled=amp_enabled)
+    y_pred = np.argmax(y_prob, axis=1)
+    test_macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+    test_auc_macro = compute_macro_auc(y_true, y_prob, num_classes=num_classes)
+
     report_text = classification_report(y_true, y_pred, target_names=class_names, digits=4, zero_division=0)
     report_dict = classification_report(y_true, y_pred, target_names=class_names, output_dict=True, zero_division=0)
     conf = confusion_matrix(y_true, y_pred).tolist()
@@ -505,6 +512,8 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     report_payload = {
         "classification_report": report_dict,
         "confusion_matrix": conf,
+        "test_macro_f1": test_macro_f1,
+        "test_auc_macro": test_auc_macro,
         "text": report_text,
     }
     with open(output_dir / "classification_report.json", "w", encoding="utf-8") as handle:
@@ -512,6 +521,8 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 
     print("[Classification Report]")
     print(report_text)
+    auc_text = f"{test_auc_macro:.4f}" if test_auc_macro is not None else "nan"
+    print(f"[Student] test_auc_macro={auc_text} test_macro_f1={test_macro_f1:.4f}")
 
     summary = {
         "dataset": dataset_spec.name,
@@ -533,7 +544,8 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "test_loss_at_best_val": float(training_summary["test_loss_at_best_val"]),
         "final_test_acc": float(training_summary["final_test_acc"]),
         "final_test_loss": float(training_summary["final_test_loss"]),
-        "macro_f1": float(report_dict.get("macro avg", {}).get("f1-score", 0.0)),
+        "auc_macro": test_auc_macro,
+        "macro_f1": test_macro_f1,
         "weighted_f1": float(report_dict.get("weighted avg", {}).get("f1-score", 0.0)),
     }
 
@@ -547,12 +559,17 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train student from distilled triplet data: {images, weights, soft_labels}")
-    parser.add_argument("--dataset", type=normalize_dataset_key, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--dataset", default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--distilled-data", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")
 
-    parser.add_argument("--student-backbone", type=str, default="resnet50", choices=["resnet18", "resnet50"])
+    parser.add_argument(
+        "--student-backbone",
+        type=normalize_backbone_name,
+        default="resnet50",
+        choices=list(SUPPORTED_BACKBONES),
+    )
     parser.add_argument("--train-epochs", type=int, default=20)
     parser.add_argument("--train-batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=128)

@@ -1,10 +1,15 @@
+import json
 import os
 import random
 import warnings
 from pathlib import Path
+from PIL import Image
+import warnings
+import functools
 
 import numpy as np
 import torch
+from torchvision.utils import make_grid
 
 
 IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(3, 1, 1)
@@ -58,3 +63,158 @@ def resolve_device(device_arg: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def save_preview_grid(images: torch.Tensor, output_path: Path, max_images: int = 100) -> None:
+    n = min(max_images, images.size(0))
+    if n <= 0:
+        return
+    grid = make_grid(images[:n], nrow=min(10, n), pad_value=1.0)
+    grid_np = (grid.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    Image.fromarray(grid_np).save(output_path)
+
+
+def save_distilled_images(images: torch.Tensor, labels: torch.Tensor, output_dir: Path) -> list[str]:
+    image_root = output_dir / "distilled_images"
+    image_root.mkdir(parents=True, exist_ok=True)
+
+    rel_paths: list[str] = []
+    for idx in range(images.size(0)):
+        class_id = int(labels[idx].item())
+        class_dir = image_root / f"class_{class_id}"
+        class_dir.mkdir(parents=True, exist_ok=True)
+
+        rel_path = Path(f"class_{class_id}") / f"sample_{idx:05d}.png"
+        abs_path = image_root / rel_path
+
+        image_np = (images[idx].permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        Image.fromarray(image_np).save(abs_path)
+        rel_paths.append(str(rel_path))
+
+    return rel_paths
+
+
+def save_distillation_artifacts(
+    output_dir: Path,
+    images: torch.Tensor,
+    weights: torch.Tensor,
+    influences: torch.Tensor,
+    soft_labels: torch.Tensor,
+    center_labels: torch.Tensor,
+    counts: torch.Tensor,
+    saved_paths: list[str],
+    dataset_name: str,
+    lora_path: str,
+) -> None:
+    # Keep only the triplet required by downstream training.
+    torch.save(
+        {
+            "images": images,
+            "weights": weights,
+            "influences": influences,
+            "soft_labels": soft_labels,
+            "dataset": dataset_name,
+            "lora_path": lora_path,
+        },
+        output_dir / "distilled_data.pt",
+    )
+
+    metadata = {
+        "dataset": dataset_name,
+        "lora_path": lora_path,
+        "num_distilled": int(images.size(0)),
+        "weights_sum": float(weights.sum().item()),
+        "soft_labels_shape": list(soft_labels.shape),
+        "center_labels": [int(v) for v in center_labels.tolist()],
+        "cluster_counts": [int(v) for v in counts.tolist()],
+        "center_influences": [float(v) for v in influences.tolist()],
+        "image_relative_paths": saved_paths,
+    }
+    with open(output_dir / "distilled_metadata.json", "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+
+
+
+def save_latent_cache(
+    cache_path: Path,
+    latents: torch.Tensor,
+    labels: torch.Tensor,
+    dataset_name: str,
+    vae_model_id: str,
+    image_size: int,
+) -> None:
+    torch.save(
+        {
+            "latents": latents.float().cpu(),
+            "labels": labels.long().cpu(),
+            "dataset": dataset_name,
+            "vae_model_id": vae_model_id,
+            "image_size": int(image_size),
+        },
+        cache_path,
+    )
+    print(f"[Encoding] Saved latent cache: {cache_path}")
+
+
+def load_latent_cache(
+    cache_path: Path,
+    expected_num_samples: int,
+    expected_dataset: str,
+    expected_vae_model_id: str,
+    expected_image_size: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = torch.load(cache_path, map_location="cpu")
+    except Exception as exc:
+        warnings.warn(f"Failed to load latent cache ({cache_path}): {exc}", RuntimeWarning)
+        return None
+
+    if not isinstance(payload, dict):
+        warnings.warn(f"Latent cache format invalid: {cache_path}", RuntimeWarning)
+        return None
+
+    cached_dataset = payload.get("dataset")
+    if cached_dataset is not None and str(cached_dataset) != str(expected_dataset):
+        warnings.warn(
+            f"Latent cache dataset mismatch ({cached_dataset} != {expected_dataset}), re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    cached_model_id = payload.get("vae_model_id")
+    if cached_model_id is not None and str(cached_model_id) != str(expected_vae_model_id):
+        warnings.warn(
+            f"Latent cache VAE mismatch ({cached_model_id} != {expected_vae_model_id}), re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    cached_image_size = payload.get("image_size")
+    if cached_image_size is not None and int(cached_image_size) != int(expected_image_size):
+        warnings.warn(
+            f"Latent cache image size mismatch ({cached_image_size} != {expected_image_size}), re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    latents = payload.get("latents")
+    labels = payload.get("labels")
+    if not isinstance(latents, torch.Tensor) or not isinstance(labels, torch.Tensor):
+        warnings.warn(f"Latent cache missing tensor fields: {cache_path}", RuntimeWarning)
+        return None
+
+    latents = latents.float().cpu()
+    labels = labels.long().view(-1).cpu()
+    if latents.size(0) != expected_num_samples or labels.size(0) != expected_num_samples:
+        warnings.warn(
+            f"Latent cache sample count mismatch ({latents.size(0)}/{labels.size(0)} != {expected_num_samples}), "
+            "re-encoding.",
+            RuntimeWarning,
+        )
+        return None
+
+    print(f"[Encoding] Loaded latent cache: {cache_path}")
+    return latents, labels

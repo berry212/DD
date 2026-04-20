@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,14 +11,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline
-from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
-from torchvision.utils import make_grid
 
 from .baseline_resnet18 import load_teacher_checkpoint, train_teacher_baseline
-from .datasets import MedMNISTImageDataset, get_dataset_spec, normalize_dataset_key, supported_datasets
+from .datasets import TorchDataset, get_dataset_spec, supported_datasets
 from .utils import *
 
 
@@ -70,7 +67,7 @@ def build_encode_loader(
     )
 
     return DataLoader(
-        MedMNISTImageDataset(train_set, transform=encode_transform),
+        TorchDataset(train_set, transform=encode_transform),
         batch_size=encode_batch_size,
         shuffle=False,
         num_workers=num_workers,
@@ -114,91 +111,6 @@ def encode_training_images(
             print(f"[Encoding] batch {batch_idx}/{total_batches}")
 
     return torch.cat(all_latents, dim=0), torch.cat(all_labels, dim=0)
-
-
-def save_latent_cache(
-    cache_path: Path,
-    latents: torch.Tensor,
-    labels: torch.Tensor,
-    dataset_name: str,
-    vae_model_id: str,
-    image_size: int,
-) -> None:
-    torch.save(
-        {
-            "latents": latents.float().cpu(),
-            "labels": labels.long().cpu(),
-            "dataset": dataset_name,
-            "vae_model_id": vae_model_id,
-            "image_size": int(image_size),
-        },
-        cache_path,
-    )
-    print(f"[Encoding] Saved latent cache: {cache_path}")
-
-
-def load_latent_cache(
-    cache_path: Path,
-    expected_num_samples: int,
-    expected_dataset: str,
-    expected_vae_model_id: str,
-    expected_image_size: int,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not cache_path.exists():
-        return None
-
-    try:
-        payload = torch.load(cache_path, map_location="cpu")
-    except Exception as exc:
-        warnings.warn(f"Failed to load latent cache ({cache_path}): {exc}", RuntimeWarning)
-        return None
-
-    if not isinstance(payload, dict):
-        warnings.warn(f"Latent cache format invalid: {cache_path}", RuntimeWarning)
-        return None
-
-    cached_dataset = payload.get("dataset")
-    if cached_dataset is not None and str(cached_dataset) != str(expected_dataset):
-        warnings.warn(
-            f"Latent cache dataset mismatch ({cached_dataset} != {expected_dataset}), re-encoding.",
-            RuntimeWarning,
-        )
-        return None
-
-    cached_model_id = payload.get("vae_model_id")
-    if cached_model_id is not None and str(cached_model_id) != str(expected_vae_model_id):
-        warnings.warn(
-            f"Latent cache VAE mismatch ({cached_model_id} != {expected_vae_model_id}), re-encoding.",
-            RuntimeWarning,
-        )
-        return None
-
-    cached_image_size = payload.get("image_size")
-    if cached_image_size is not None and int(cached_image_size) != int(expected_image_size):
-        warnings.warn(
-            f"Latent cache image size mismatch ({cached_image_size} != {expected_image_size}), re-encoding.",
-            RuntimeWarning,
-        )
-        return None
-
-    latents = payload.get("latents")
-    labels = payload.get("labels")
-    if not isinstance(latents, torch.Tensor) or not isinstance(labels, torch.Tensor):
-        warnings.warn(f"Latent cache missing tensor fields: {cache_path}", RuntimeWarning)
-        return None
-
-    latents = latents.float().cpu()
-    labels = labels.long().view(-1).cpu()
-    if latents.size(0) != expected_num_samples or labels.size(0) != expected_num_samples:
-        warnings.warn(
-            f"Latent cache sample count mismatch ({latents.size(0)}/{labels.size(0)} != {expected_num_samples}), "
-            "re-encoding.",
-            RuntimeWarning,
-        )
-        return None
-
-    print(f"[Encoding] Loaded latent cache: {cache_path}")
-    return latents, labels
 
 
 def compute_image_gradient_influence(
@@ -635,74 +547,6 @@ class ReverseSDEDecoder:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-def save_preview_grid(images: torch.Tensor, output_path: Path, max_images: int = 100) -> None:
-    n = min(max_images, images.size(0))
-    if n <= 0:
-        return
-    grid = make_grid(images[:n], nrow=min(10, n), pad_value=1.0)
-    grid_np = (grid.permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-    Image.fromarray(grid_np).save(output_path)
-
-
-def save_distilled_images(images: torch.Tensor, labels: torch.Tensor, output_dir: Path) -> list[str]:
-    image_root = output_dir / "distilled_images"
-    image_root.mkdir(parents=True, exist_ok=True)
-
-    rel_paths: list[str] = []
-    for idx in range(images.size(0)):
-        class_id = int(labels[idx].item())
-        class_dir = image_root / f"class_{class_id}"
-        class_dir.mkdir(parents=True, exist_ok=True)
-
-        rel_path = Path(f"class_{class_id}") / f"sample_{idx:05d}.png"
-        abs_path = image_root / rel_path
-
-        image_np = (images[idx].permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        Image.fromarray(image_np).save(abs_path)
-        rel_paths.append(str(rel_path))
-
-    return rel_paths
-
-
-def save_distillation_artifacts(
-    output_dir: Path,
-    images: torch.Tensor,
-    weights: torch.Tensor,
-    influences: torch.Tensor,
-    soft_labels: torch.Tensor,
-    center_labels: torch.Tensor,
-    counts: torch.Tensor,
-    saved_paths: list[str],
-    dataset_name: str,
-    lora_path: str,
-) -> None:
-    # Keep only the triplet required by downstream training.
-    torch.save(
-        {
-            "images": images,
-            "weights": weights,
-            "influences": influences,
-            "soft_labels": soft_labels,
-            "dataset": dataset_name,
-            "lora_path": lora_path,
-        },
-        output_dir / "distilled_data.pt",
-    )
-
-    metadata = {
-        "dataset": dataset_name,
-        "lora_path": lora_path,
-        "num_distilled": int(images.size(0)),
-        "weights_sum": float(weights.sum().item()),
-        "soft_labels_shape": list(soft_labels.shape),
-        "center_labels": [int(v) for v in center_labels.tolist()],
-        "cluster_counts": [int(v) for v in counts.tolist()],
-        "center_influences": [float(v) for v in influences.tolist()],
-        "image_relative_paths": saved_paths,
-    }
-    with open(output_dir / "distilled_metadata.json", "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
-
 
 def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
@@ -722,12 +566,11 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
         json.dump(run_config, handle, indent=2)
 
-    split_bundle = dataset_spec.load_distillation_splits(data_root=args.data_root, image_size=args.image_size)
+    split_bundle = dataset_spec.load_dataset_splits(data_root=args.data_root, image_size=args.image_size)
     train_set = split_bundle.train_set
     val_set = split_bundle.val_set
     test_set = split_bundle.test_set
     num_classes = split_bundle.num_classes
-    class_names = split_bundle.class_names
     print(
         f"[Setup] dataset={dataset_spec.name} device={device} "
         f"train={len(train_set)} classes={num_classes} baseline_dir={teacher_baseline_dir} "
@@ -762,7 +605,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     # Latents are independent of IPC, so cache them under dataset baseline dir.
     latent_cache_path = teacher_baseline_dir / "train_latents.pt"
-    legacy_latent_cache_path = output_dir / "train_latents.pt"
     vae_dtype = torch.float16 if amp_enabled else torch.float32
     vae, scaling_factor = load_vae(args.vae_model_id, device=device, dtype=vae_dtype)
 
@@ -775,27 +617,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     latent_source = "cache"
-    if cached_latents is None and legacy_latent_cache_path != latent_cache_path:
-        legacy_cached_latents = load_latent_cache(
-            cache_path=legacy_latent_cache_path,
-            expected_num_samples=len(train_set),
-            expected_dataset=dataset_spec.name,
-            expected_vae_model_id=args.vae_model_id,
-            expected_image_size=args.image_size,
-        )
-        if legacy_cached_latents is not None:
-            latents, latent_labels = legacy_cached_latents
-            save_latent_cache(
-                cache_path=latent_cache_path,
-                latents=latents,
-                labels=latent_labels,
-                dataset_name=dataset_spec.name,
-                vae_model_id=args.vae_model_id,
-                image_size=args.image_size,
-            )
-            cached_latents = (latents, latent_labels)
-            latent_source = "legacy_cache"
-
     if cached_latents is None:
         encode_loader = build_encode_loader(
             train_set=train_set,
@@ -868,7 +689,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         weight_influence_power=args.weight_influence_power,
     )
 
-    class_prompts = dataset_spec.build_class_prompts(class_names)
+    class_prompts = dataset_spec.build_class_prompts()
     decoder = ReverseSDEDecoder(
         model_id=args.diffusion_model_id,
         vae=vae,
@@ -952,7 +773,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Dataset distillation: teacher training + VAE encode + class-wise CLVQ + reverse-SDE decode"
     )
-    parser.add_argument("--dataset", type=normalize_dataset_key, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--dataset", default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--teacher-baseline-dir", type=str, default="")

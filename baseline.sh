@@ -12,8 +12,30 @@ fi
 
 DATA_ROOT="${DATA_ROOT:-${HF_DATASETS_CACHE:-${HF_HOME:-data}}}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_distill_baseline}"
-TEACHER_BACKBONE="${TEACHER_BACKBONE:-resnet50}"
+TEACHER_BACKBONE="${TEACHER_BACKBONE:-${BACKBONE:-resnet50}}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-10}"
+
+if [[ -z "${TEACHER_BATCH_SIZE:-}" ]]; then
+    case "${TEACHER_BACKBONE}" in
+        vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
+            TEACHER_BATCH_SIZE="64"
+            ;;
+        *)
+            TEACHER_BATCH_SIZE="128"
+            ;;
+    esac
+fi
+
+if [[ -z "${EVAL_BATCH_SIZE:-}" ]]; then
+    case "${TEACHER_BACKBONE}" in
+        vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
+            EVAL_BATCH_SIZE="64"
+            ;;
+        *)
+            EVAL_BATCH_SIZE="128"
+            ;;
+    esac
+fi
 
 if [[ "$DATASET" == "aptos-2019-blindness-detection" ]]; then
     if [[ ! -f "$DATA_ROOT/train.csv" || ! -d "$DATA_ROOT/train_images" ]]; then
@@ -33,4 +55,6 @@ uv run run-baseline-resnet18 \
     --output-dir "$OUTPUT_DIR" \
     --teacher-backbone "$TEACHER_BACKBONE" \
     --teacher-epochs "$TEACHER_EPOCHS" \
+    --teacher-batch-size "$TEACHER_BATCH_SIZE" \
+    --eval-batch-size "$EVAL_BATCH_SIZE" \
     "$@"

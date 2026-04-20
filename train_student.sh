@@ -17,6 +17,28 @@ DISTILLED_DIR="${DISTILLED_DIR:-outputs/${DATASET}_224_distill_ipc${IPC}}"
 DISTILLED_DATA="${DISTILLED_DATA:-${DISTILLED_DIR}/distilled_data.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_student_ipc${IPC}}"
 
+if [[ -z "${TRAIN_BATCH_SIZE:-}" ]]; then
+  case "${BACKBONE}" in
+    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
+      TRAIN_BATCH_SIZE="32"
+      ;;
+    *)
+      TRAIN_BATCH_SIZE="64"
+      ;;
+  esac
+fi
+
+if [[ -z "${EVAL_BATCH_SIZE:-}" ]]; then
+  case "${BACKBONE}" in
+    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
+      EVAL_BATCH_SIZE="64"
+      ;;
+    *)
+      EVAL_BATCH_SIZE="128"
+      ;;
+  esac
+fi
+
 if [[ "$DATASET" == "aptos-2019-blindness-detection" ]]; then
   if [[ ! -f "$DATA_ROOT/train.csv" || ! -d "$DATA_ROOT/train_images" ]]; then
     if [[ ! -f "$DATA_ROOT/APTOS_2019_Blindness_Detection/train.csv" || ! -d "$DATA_ROOT/APTOS_2019_Blindness_Detection/train_images" ]]; then
@@ -76,8 +98,8 @@ uv run run-train-distilled-student \
   --output-dir "$OUTPUT_DIR" \
   --student-backbone "$BACKBONE" \
   --train-epochs 20 \
-  --train-batch-size 64 \
-  --eval-batch-size 128 \
+  --train-batch-size "$TRAIN_BATCH_SIZE" \
+  --eval-batch-size "$EVAL_BATCH_SIZE" \
   --train-lr 3e-4 \
   --weight-decay 1e-4 \
   --kd-temperature "$KD_TEMPERATURE" \
