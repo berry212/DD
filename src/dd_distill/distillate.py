@@ -25,7 +25,6 @@ class CLVQResult:
     centers: torch.Tensor
     center_labels: torch.Tensor
     counts: torch.Tensor
-    influences: torch.Tensor
     weights: torch.Tensor
 
 
@@ -113,70 +112,6 @@ def encode_training_images(
     return torch.cat(all_latents, dim=0), torch.cat(all_labels, dim=0)
 
 
-def compute_image_gradient_influence(
-    teacher: nn.Module,
-    data_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    device: torch.device,
-    log_prefix: str = "[Influence-ImageGrad]",
-) -> torch.Tensor:
-    teacher.eval()
-    teacher.requires_grad_(False)
-
-    score_chunks: list[torch.Tensor] = []
-    total_batches = len(data_loader)
-    print(f"{log_prefix} start: total_batches={total_batches}, device={device}")
-
-    for batch_idx, (images, labels) in enumerate(data_loader, start=1):
-        images = images.to(device=device, dtype=torch.float32)
-        labels = labels.to(device=device)
-
-        if labels.ndim > 1:
-            labels = labels.argmax(dim=1)
-        labels = labels.long().view(-1)
-
-        images.requires_grad_(True)
-        logits = teacher(normalize_batch(images))
-        per_sample_loss = F.cross_entropy(logits, labels, reduction="none")
-        input_grads = torch.autograd.grad(
-            outputs=per_sample_loss.sum(),
-            inputs=images,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
-        grad_norm = input_grads.view(input_grads.size(0), -1).norm(p=2, dim=1).detach().cpu()
-        score_chunks.append(grad_norm)
-
-        if batch_idx % 20 == 0 or batch_idx == total_batches:
-            print(f"{log_prefix} batch {batch_idx}/{total_batches}")
-
-    if not score_chunks:
-        raise RuntimeError("Failed to compute image gradient influence: no batches available.")
-
-    return torch.cat(score_chunks, dim=0)
-
-
-def stabilize_influence_scores(
-    scores: torch.Tensor,
-    quantile: float = 0.85,
-    min_value: float = 1e-3,
-    max_value: float = 1.0,
-    log_prefix: str = "[Influence-Stabilize]",
-) -> torch.Tensor:
-    phi = scores.float().clamp_min(1e-12)
-    q = float(np.clip(quantile, 0.0, 1.0))
-    tau = torch.quantile(phi, q=q).clamp_min(1e-12)
-
-    # Clip extreme influence values by quantile and map into [0, 1].
-    phi_tilde = torch.minimum(phi, tau) / tau
-    phi_tilde = phi_tilde.clamp(min=float(min_value), max=float(max_value))
-
-    print(
-        f"{log_prefix} q={q:.2f} tau={float(tau.item()):.6e} "
-        f"phi_tilde_range=[{float(phi_tilde.min().item()):.6e}, {float(phi_tilde.max().item()):.6e}]"
-    )
-    return phi_tilde
-
-
 def initialize_clvq_centers(data: np.ndarray, num_centers: int, seed: int) -> np.ndarray:
     if num_centers <= 0:
         raise ValueError("num_centers must be positive.")
@@ -255,10 +190,7 @@ def classwise_clvq(
     tol: float,
     check_interval: int,
     medoid_anchor: float,
-    sample_influence: torch.Tensor | None,
-    influence_blend_beta: float,
     weight_count_power: float,
-    weight_influence_power: float,
 ) -> CLVQResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
@@ -266,35 +198,21 @@ def classwise_clvq(
     medoid_anchor = float(np.clip(medoid_anchor, 0.0, 1.0))
     check_interval = max(1, int(check_interval))
     max_iter = max(1, int(max_iter))
-    beta = float(np.clip(influence_blend_beta, 0.0, 1.0))
     count_power = float(max(weight_count_power, 1e-6))
-    influence_power = float(max(weight_influence_power, 1e-6))
 
     latents = latents.float().cpu()
     labels = labels.long().view(-1).cpu()
-    if sample_influence is None:
-        sample_influence_np = np.ones((latents.size(0),), dtype=np.float32)
-    else:
-        sample_influence_np = sample_influence.float().view(-1).cpu().numpy().astype(np.float32, copy=False)
-        if int(sample_influence_np.shape[0]) != int(latents.size(0)):
-            raise ValueError(
-                f"sample_influence size mismatch: expected {latents.size(0)}, got {sample_influence_np.shape[0]}"
-            )
-    sample_influence_np = np.clip(sample_influence_np, 1e-3, 1.0)
 
     flat_latents = latents.view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
     labels_np = labels.numpy().astype(np.int64, copy=False)
-    total_samples = int(flat_latents.shape[0])
 
     center_chunks: list[torch.Tensor] = []
     label_chunks: list[torch.Tensor] = []
     count_chunks: list[torch.Tensor] = []
-    influence_chunks: list[torch.Tensor] = []
 
     for class_id in range(num_classes):
         class_selector = labels_np == class_id
         class_latents = flat_latents[class_selector]
-        class_influence = sample_influence_np[class_selector]
         class_samples = int(class_latents.shape[0])
         if class_samples == 0:
             warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
@@ -342,20 +260,10 @@ def classwise_clvq(
             assignments = assign_to_centers(class_latents, centers, batch_size=2048)
 
         counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
-        influence_sum = np.bincount(
-            assignments,
-            weights=class_influence.astype(np.float64, copy=False),
-            minlength=class_k,
-        ).astype(np.float64)
-        mean_influence = np.full((class_k,), fill_value=1e-3, dtype=np.float32)
-        nonzero = counts > 0
-        mean_influence[nonzero] = (influence_sum[nonzero] / np.maximum(counts[nonzero], 1)).astype(np.float32)
-        mean_influence = np.clip(mean_influence, 1e-3, 1.0)
 
         non_empty_mask = counts > 0
         centers = centers[non_empty_mask]
         counts = counts[non_empty_mask]
-        mean_influence = mean_influence[non_empty_mask]
 
         if centers.shape[0] == 0:
             continue
@@ -363,11 +271,10 @@ def classwise_clvq(
         center_chunks.append(torch.from_numpy(centers).view(centers.shape[0], *latents.shape[1:]).float())
         label_chunks.append(torch.full((centers.shape[0],), fill_value=class_id, dtype=torch.long))
         count_chunks.append(torch.from_numpy(counts))
-        influence_chunks.append(torch.from_numpy(mean_influence).float())
 
         print(
             f"[CLVQ-Class] class={class_id} samples={class_samples} kept={centers.shape[0]} "
-            f"mean_influence={float(np.mean(mean_influence)):.4f} medoid_anchor={medoid_anchor:.2f}"
+            f"medoid_anchor={medoid_anchor:.2f}"
         )
 
     if not center_chunks:
@@ -376,23 +283,16 @@ def classwise_clvq(
     centers_t = torch.cat(center_chunks, dim=0)
     labels_t = torch.cat(label_chunks, dim=0)
     counts_t = torch.cat(count_chunks, dim=0)
-    influences_t = torch.cat(influence_chunks, dim=0).float().clamp(1e-3, 1.0)
 
     count_signal_t = counts_t.float().clamp_min(1.0).pow(count_power)
     count_weights_t = count_signal_t / count_signal_t.sum().clamp_min(1e-12)
 
-    influence_signal_t = influences_t.pow(influence_power)
-    influence_weights_t = count_signal_t * influence_signal_t
-    influence_weights_t = influence_weights_t / influence_weights_t.sum().clamp_min(1e-12)
-
-    weights_t = (1.0 - beta) * count_weights_t + beta * influence_weights_t
-    weights_t = weights_t / weights_t.sum().clamp_min(1e-12)
+    weights_t = count_weights_t / count_weights_t.sum().clamp_min(1e-12)
 
     return CLVQResult(
         centers=centers_t,
         center_labels=labels_t,
         counts=counts_t,
-        influences=influences_t,
         weights=weights_t,
     )
 
@@ -645,32 +545,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     else:
         latents, latent_labels = cached_latents
 
-    influence_mode = str(args.influence_mode).strip().lower()
-    sample_influence: torch.Tensor | None = None
-    if influence_mode == "image-grad":
-        influence_loader = build_encode_loader(
-            train_set=train_set,
-            image_size=args.image_size,
-            encode_batch_size=args.encode_batch_size,
-            num_workers=args.num_workers,
-            device=device,
-        )
-        raw_influence = compute_image_gradient_influence(
-            teacher=teacher,
-            data_loader=influence_loader,
-            device=device,
-            log_prefix="[Influence-ImageGrad]",
-        )
-        sample_influence = stabilize_influence_scores(
-            raw_influence,
-            quantile=args.influence_quantile,
-            min_value=args.influence_min_value,
-            max_value=args.influence_max_value,
-            log_prefix="[Influence-Sample]",
-        )
-    elif influence_mode != "none":
-        raise ValueError(f"Unsupported influence mode: {args.influence_mode}")
-
     clvq = classwise_clvq(
         latents=latents,
         labels=latent_labels,
@@ -683,10 +557,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         tol=args.clvq_tol,
         check_interval=args.clvq_check_interval,
         medoid_anchor=args.clvq_medoid_anchor,
-        sample_influence=sample_influence,
-        influence_blend_beta=args.influence_blend_beta,
         weight_count_power=args.weight_count_power,
-        weight_influence_power=args.weight_influence_power,
     )
 
     class_prompts = dataset_spec.build_class_prompts()
@@ -723,7 +594,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         output_dir=output_dir,
         images=distilled_images,
         weights=clvq.weights,
-        influences=clvq.influences,
         soft_labels=soft_labels,
         center_labels=clvq.center_labels,
         counts=clvq.counts,
@@ -747,16 +617,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "num_distilled": int(distilled_images.size(0)),
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
-        "influence_mode": influence_mode,
-        "influence_blend_beta": float(args.influence_blend_beta),
         "weight_count_power": float(args.weight_count_power),
-        "weight_influence_power": float(args.weight_influence_power),
-        "influence_quantile": float(args.influence_quantile),
-        "influence_min_value": float(args.influence_min_value),
-        "influence_max_value": float(args.influence_max_value),
-        "center_influence_mean": float(clvq.influences.mean().item()),
-        "center_influence_min": float(clvq.influences.min().item()),
-        "center_influence_max": float(clvq.influences.max().item()),
         "lora_path": resolved_lora_path,
         "latent_cache_path": str(latent_cache_path),
         "latent_source": latent_source,
@@ -785,13 +646,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clvq-tol", type=float, default=1e-5)
     parser.add_argument("--clvq-check-interval", type=int, default=500)
     parser.add_argument("--clvq-medoid-anchor", type=float, default=0.0)
-    parser.add_argument("--influence-mode", type=str, default="image-grad", choices=["none", "image-grad"])
-    parser.add_argument("--influence-blend-beta", type=float, default=0.25)
     parser.add_argument("--weight-count-power", type=float, default=0.5)
-    parser.add_argument("--weight-influence-power", type=float, default=1.5)
-    parser.add_argument("--influence-quantile", type=float, default=0.85)
-    parser.add_argument("--influence-min-value", type=float, default=1e-3)
-    parser.add_argument("--influence-max-value", type=float, default=1.0)
 
     parser.add_argument("--encode-batch-size", type=int, default=64)
     parser.add_argument("--decode-batch-size", type=int, default=32)

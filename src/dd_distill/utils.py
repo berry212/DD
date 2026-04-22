@@ -98,7 +98,6 @@ def save_distillation_artifacts(
     output_dir: Path,
     images: torch.Tensor,
     weights: torch.Tensor,
-    influences: torch.Tensor,
     soft_labels: torch.Tensor,
     center_labels: torch.Tensor,
     counts: torch.Tensor,
@@ -111,7 +110,6 @@ def save_distillation_artifacts(
         {
             "images": images,
             "weights": weights,
-            "influences": influences,
             "soft_labels": soft_labels,
             "dataset": dataset_name,
             "lora_path": lora_path,
@@ -127,7 +125,6 @@ def save_distillation_artifacts(
         "soft_labels_shape": list(soft_labels.shape),
         "center_labels": [int(v) for v in center_labels.tolist()],
         "cluster_counts": [int(v) for v in counts.tolist()],
-        "center_influences": [float(v) for v in influences.tolist()],
         "image_relative_paths": saved_paths,
     }
     with open(output_dir / "distilled_metadata.json", "w", encoding="utf-8") as handle:
