@@ -322,10 +322,10 @@ def classwise_clvq(
             if (step + 1) % check_interval == 0 or (step + 1) == max_iter:
                 denom = np.linalg.norm(prev_centers) + 1e-12
                 relative_shift = float(np.linalg.norm(centers - prev_centers) / denom)
-                print(
-                    f"[CLVQ-Class] class={class_id} iter={step + 1}/{max_iter} "
-                    f"relative_shift={relative_shift:.6e}"
-                )
+                # print(
+                #     f"[CLVQ-Class] class={class_id} iter={step + 1}/{max_iter} "
+                #     f"relative_shift={relative_shift:.6e}"
+                # )
                 if relative_shift < tol:
                     break
                 prev_centers = centers.copy()
