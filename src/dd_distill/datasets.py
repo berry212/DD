@@ -8,7 +8,7 @@ from typing import Any, cast, override
 
 import numpy as np
 import torch
-from medmnist import INFO, BloodMNIST, DermaMNIST
+from medmnist import INFO, BloodMNIST, DermaMNIST, PathMNIST
 from PIL import Image
 from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
@@ -157,6 +157,11 @@ class BloodMNIST(MedMNIST):
     name = "bloodmnist"
     prompt_prefix = "microscopic image of blood cell"
     split_class = BloodMNIST
+
+class PathMNIST(MedMNIST):
+    name = "pathmnist"
+    prompt_prefix = "histopathology image of"
+    split_class = PathMNIST
 
 
 class APTOS2019BlindnessDetectionSpec(BaseDataset):
