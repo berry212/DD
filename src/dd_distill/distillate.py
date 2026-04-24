@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline
+from sklearn.cluster import KMeans
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -24,6 +25,14 @@ from .utils import *
 class CLVQResult:
     centers: torch.Tensor
     center_labels: torch.Tensor
+    counts: torch.Tensor
+    weights: torch.Tensor
+
+
+@dataclass
+class SelectedSamplesResult:
+    indices: torch.Tensor
+    labels: torch.Tensor
     counts: torch.Tensor
     weights: torch.Tensor
 
@@ -126,6 +135,26 @@ def initialize_clvq_centers(data: np.ndarray, num_centers: int, seed: int) -> np
     return data[chosen].astype(np.float32, copy=True)
 
 
+def target_count_for_class(class_samples: int, ipc: float) -> int:
+    if class_samples <= 0:
+        return 0
+
+    ipc_is_integer = float(ipc).is_integer()
+    if ipc_is_integer:
+        target_k = int(ipc)
+    else:
+        target_k = int(round(class_samples * float(ipc)))
+
+    return max(1, min(target_k, class_samples))
+
+
+def counts_to_weights(counts_t: torch.Tensor, count_power: float) -> torch.Tensor:
+    count_power = float(max(count_power, 1e-6))
+    count_signal_t = counts_t.float().clamp_min(1.0).pow(count_power)
+    count_weights_t = count_signal_t / count_signal_t.sum().clamp_min(1e-12)
+    return count_weights_t / count_weights_t.sum().clamp_min(1e-12)
+
+
 def assign_to_centers(data: np.ndarray, centers: np.ndarray, batch_size: int = 2048) -> np.ndarray:
     if data.size == 0 or centers.size == 0:
         raise ValueError("assign_to_centers expects non-empty data and centers.")
@@ -178,6 +207,159 @@ def anchor_centers_to_medoids(
     return anchored.astype(np.float32, copy=False)
 
 
+def nearest_samples_to_centers_unique(data: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    if data.size == 0 or centers.size == 0:
+        raise ValueError("nearest_samples_to_centers_unique expects non-empty data and centers.")
+
+    chosen: list[int] = []
+    used: set[int] = set()
+    for center in centers:
+        distances = np.sum((data - center[None, :]) ** 2, axis=1)
+        sorted_indices = np.argsort(distances)
+        picked = int(sorted_indices[0])
+        for candidate in sorted_indices:
+            candidate_i = int(candidate)
+            if candidate_i not in used:
+                picked = candidate_i
+                break
+        used.add(picked)
+        chosen.append(picked)
+
+    return np.asarray(chosen, dtype=np.int64)
+
+
+def classwise_random_selection(
+    labels: torch.Tensor,
+    clusters_per_class: float,
+    num_classes: int,
+    seed: int,
+    weight_count_power: float,
+) -> SelectedSamplesResult:
+    if clusters_per_class <= 0:
+        raise ValueError("clusters_per_class must be positive.")
+
+    ipc = float(clusters_per_class)
+    labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
+
+    index_chunks: list[torch.Tensor] = []
+    label_chunks: list[torch.Tensor] = []
+    count_chunks: list[torch.Tensor] = []
+
+    for class_id in range(num_classes):
+        class_indices = np.flatnonzero(labels_np == class_id)
+        class_samples = int(class_indices.shape[0])
+        if class_samples == 0:
+            warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
+            continue
+
+        class_k = target_count_for_class(class_samples, ipc)
+        class_seed = seed + 1009 * (class_id + 1)
+        rng = np.random.default_rng(class_seed)
+        picked = np.asarray(rng.choice(class_indices, size=class_k, replace=False), dtype=np.int64)
+
+        index_chunks.append(torch.from_numpy(picked))
+        label_chunks.append(torch.full((class_k,), fill_value=class_id, dtype=torch.long))
+        count_chunks.append(torch.ones((class_k,), dtype=torch.long))
+
+        print(f"[Random-Class] class={class_id} samples={class_samples} selected={class_k}")
+
+    if not index_chunks:
+        raise RuntimeError("Random distillation failed: no samples selected.")
+
+    indices_t = torch.cat(index_chunks, dim=0).long()
+    labels_t = torch.cat(label_chunks, dim=0).long()
+    counts_t = torch.cat(count_chunks, dim=0).long()
+    weights_t = counts_to_weights(counts_t, weight_count_power)
+
+    return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
+
+
+def classwise_kmeans_nearest_selection(
+    latents: torch.Tensor,
+    labels: torch.Tensor,
+    clusters_per_class: float,
+    num_classes: int,
+    seed: int,
+    weight_count_power: float,
+    kmeans_max_iter: int,
+) -> SelectedSamplesResult:
+    if clusters_per_class <= 0:
+        raise ValueError("clusters_per_class must be positive.")
+
+    ipc = float(clusters_per_class)
+    kmeans_max_iter = max(10, int(kmeans_max_iter))
+    flat_latents = latents.float().cpu().view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
+    labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
+
+    index_chunks: list[torch.Tensor] = []
+    label_chunks: list[torch.Tensor] = []
+    count_chunks: list[torch.Tensor] = []
+
+    for class_id in range(num_classes):
+        class_indices = np.flatnonzero(labels_np == class_id)
+        class_samples = int(class_indices.shape[0])
+        if class_samples == 0:
+            warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
+            continue
+
+        class_k = target_count_for_class(class_samples, ipc)
+        class_seed = seed + 1009 * (class_id + 1)
+        class_latents = flat_latents[class_indices]
+
+        kmeans = KMeans(n_clusters=class_k, random_state=class_seed, n_init=10, max_iter=kmeans_max_iter)
+        assignments = kmeans.fit_predict(class_latents)
+        nearest_local = nearest_samples_to_centers_unique(class_latents, kmeans.cluster_centers_)
+        picked_global = class_indices[nearest_local]
+        counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
+
+        index_chunks.append(torch.from_numpy(picked_global.astype(np.int64, copy=False)))
+        label_chunks.append(torch.full((class_k,), fill_value=class_id, dtype=torch.long))
+        count_chunks.append(torch.from_numpy(counts).long())
+
+        print(
+            f"[KMeans-Class] class={class_id} samples={class_samples} "
+            f"selected={class_k} max_iter={kmeans_max_iter}"
+        )
+
+    if not index_chunks:
+        raise RuntimeError("KMeans distillation failed: no samples selected.")
+
+    indices_t = torch.cat(index_chunks, dim=0).long()
+    labels_t = torch.cat(label_chunks, dim=0).long()
+    counts_t = torch.cat(count_chunks, dim=0).long()
+    weights_t = counts_to_weights(counts_t, weight_count_power)
+
+    return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
+
+
+def gather_images_by_indices(
+    train_set: Any,
+    indices: torch.Tensor,
+    image_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    indices_np = indices.long().cpu().numpy().astype(np.int64, copy=False)
+    if indices_np.size == 0:
+        raise ValueError("gather_images_by_indices expects at least one index.")
+
+    image_transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ]
+    )
+    dataset = TorchDataset(train_set, transform=image_transform)
+
+    images: list[torch.Tensor] = []
+    labels: list[torch.Tensor] = []
+    for raw_idx in indices_np.tolist():
+        image_t, label_t = dataset[int(raw_idx)]
+        images.append(image_t)
+        labels.append(label_t)
+
+    return torch.stack(images, dim=0), torch.stack(labels, dim=0).long()
+
+
 def classwise_clvq(
     latents: torch.Tensor,
     labels: torch.Tensor,
@@ -196,12 +378,10 @@ def classwise_clvq(
         raise ValueError("clusters_per_class must be positive.")
 
     ipc = float(clusters_per_class)
-    ipc_is_integer = float(ipc).is_integer()
 
     medoid_anchor = float(np.clip(medoid_anchor, 0.0, 1.0))
     check_interval = max(1, int(check_interval))
     max_iter = max(1, int(max_iter))
-    count_power = float(max(weight_count_power, 1e-6))
 
     latents = latents.float().cpu()
     labels = labels.long().view(-1).cpu()
@@ -221,12 +401,8 @@ def classwise_clvq(
             warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
             continue
 
-        if ipc_is_integer:
-            target_k = int(ipc)
-        else:
-            target_k = int(round(class_samples * ipc))
-
-        class_k = max(1, min(target_k, class_samples))
+        target_k = target_count_for_class(class_samples, ipc)
+        class_k = target_k
         class_seed = seed + 1009 * (class_id + 1)
         centers = initialize_clvq_centers(class_latents, class_k, class_seed)
         running_weights = np.full((class_k,), fill_value=1.0 / float(class_k), dtype=np.float64)
@@ -292,11 +468,7 @@ def classwise_clvq(
     centers_t = torch.cat(center_chunks, dim=0)
     labels_t = torch.cat(label_chunks, dim=0)
     counts_t = torch.cat(count_chunks, dim=0)
-
-    count_signal_t = counts_t.float().clamp_min(1.0).pow(count_power)
-    count_weights_t = count_signal_t / count_signal_t.sum().clamp_min(1e-12)
-
-    weights_t = count_weights_t / count_weights_t.sum().clamp_min(1e-12)
+    weights_t = counts_to_weights(counts_t, weight_count_power)
 
     return CLVQResult(
         centers=centers_t,
@@ -554,39 +726,84 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     else:
         latents, latent_labels = cached_latents
 
-    clvq = classwise_clvq(
-        latents=latents,
-        labels=latent_labels,
-        clusters_per_class=args.clusters_per_class,
-        num_classes=num_classes,
-        seed=args.seed,
-        gamma_0=args.clvq_gamma0,
-        alpha=args.clvq_alpha,
-        max_iter=args.clvq_max_iter,
-        tol=args.clvq_tol,
-        check_interval=args.clvq_check_interval,
-        medoid_anchor=args.clvq_medoid_anchor,
-        weight_count_power=args.weight_count_power,
-    )
+    if args.distill_method == "clvq":
+        clvq = classwise_clvq(
+            latents=latents,
+            labels=latent_labels,
+            clusters_per_class=args.clusters_per_class,
+            num_classes=num_classes,
+            seed=args.seed,
+            gamma_0=args.clvq_gamma0,
+            alpha=args.clvq_alpha,
+            max_iter=args.clvq_max_iter,
+            tol=args.clvq_tol,
+            check_interval=args.clvq_check_interval,
+            medoid_anchor=args.clvq_medoid_anchor,
+            weight_count_power=args.weight_count_power,
+        )
 
-    class_prompts = dataset_spec.build_class_prompts()
-    decoder = ReverseSDEDecoder(
-        model_id=args.diffusion_model_id,
-        vae=vae,
-        device=device,
-        dtype=vae_dtype,
-        num_inference_steps=args.sde_steps,
-        noise_strength=args.sde_noise_strength,
-        lora_path=resolved_lora_path,
-        lora_scale=args.lora_scale,
-        class_prompts=class_prompts,
-        guidance_scale=args.guidance_scale,
-    )
+        class_prompts = dataset_spec.build_class_prompts()
+        decoder = ReverseSDEDecoder(
+            model_id=args.diffusion_model_id,
+            vae=vae,
+            device=device,
+            dtype=vae_dtype,
+            num_inference_steps=args.sde_steps,
+            noise_strength=args.sde_noise_strength,
+            lora_path=resolved_lora_path,
+            lora_scale=args.lora_scale,
+            class_prompts=class_prompts,
+            guidance_scale=args.guidance_scale,
+        )
 
-    try:
-        distilled_images = decoder.decode(clvq.centers, clvq.center_labels, args.decode_batch_size)
-    finally:
-        decoder.cleanup()
+        try:
+            distilled_images = decoder.decode(clvq.centers, clvq.center_labels, args.decode_batch_size)
+        finally:
+            decoder.cleanup()
+
+        distilled_labels = clvq.center_labels
+        distilled_counts = clvq.counts
+        distilled_weights = clvq.weights
+    elif args.distill_method == "random":
+        selected = classwise_random_selection(
+            labels=latent_labels,
+            clusters_per_class=args.clusters_per_class,
+            num_classes=num_classes,
+            seed=args.seed,
+            weight_count_power=args.weight_count_power,
+        )
+        distilled_images, gathered_labels = gather_images_by_indices(
+            train_set=train_set,
+            indices=selected.indices,
+            image_size=args.image_size,
+        )
+        if not torch.equal(gathered_labels.cpu(), selected.labels.cpu()):
+            warnings.warn("Gathered labels mismatch selected labels; using gathered labels.", RuntimeWarning)
+        distilled_labels = gathered_labels.long().cpu()
+        distilled_counts = selected.counts
+        distilled_weights = selected.weights
+    elif args.distill_method == "kmeans":
+        selected = classwise_kmeans_nearest_selection(
+            latents=latents,
+            labels=latent_labels,
+            clusters_per_class=args.clusters_per_class,
+            num_classes=num_classes,
+            seed=args.seed,
+            weight_count_power=args.weight_count_power,
+            kmeans_max_iter=args.kmeans_max_iter,
+        )
+        distilled_images, gathered_labels = gather_images_by_indices(
+            train_set=train_set,
+            indices=selected.indices,
+            image_size=args.image_size,
+        )
+        if not torch.equal(gathered_labels.cpu(), selected.labels.cpu()):
+            warnings.warn("Gathered labels mismatch selected labels; using gathered labels.", RuntimeWarning)
+        distilled_labels = gathered_labels.long().cpu()
+        distilled_counts = selected.counts
+        distilled_weights = selected.weights
+    else:
+        raise ValueError(f"Unsupported distill method: {args.distill_method}")
 
     soft_labels = make_teacher_soft_labels(
         teacher=teacher,
@@ -597,15 +814,15 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     save_preview_grid(distilled_images, output_dir / "distilled_preview.png")
-    saved_paths = save_distilled_images(distilled_images, clvq.center_labels, output_dir)
+    saved_paths = save_distilled_images(distilled_images, distilled_labels, output_dir)
 
     save_distillation_artifacts(
         output_dir=output_dir,
         images=distilled_images,
-        weights=clvq.weights,
+        weights=distilled_weights,
         soft_labels=soft_labels,
-        center_labels=clvq.center_labels,
-        counts=clvq.counts,
+        center_labels=distilled_labels,
+        counts=distilled_counts,
         saved_paths=saved_paths,
         dataset_name=dataset_spec.name,
         lora_path=resolved_lora_path,
@@ -620,9 +837,10 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "data_root": args.data_root,
         "teacher_baseline_dir": str(teacher_baseline_dir),
         "num_classes": int(num_classes),
-        "clvq_mode": "class-wise-clvq",
+        "distill_method": str(args.distill_method),
         "clusters_per_class": float(args.clusters_per_class),
         "clvq_medoid_anchor": float(args.clvq_medoid_anchor),
+        "kmeans_max_iter": int(args.kmeans_max_iter),
         "num_distilled": int(distilled_images.size(0)),
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
@@ -641,7 +859,10 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Dataset distillation: teacher training + VAE encode + class-wise CLVQ + reverse-SDE decode"
+        description=(
+            "Dataset distillation: teacher training + VAE encode + class-wise CLVQ/KMeans/Random selection "
+            "+ optional reverse-SDE decode"
+        )
     )
     parser.add_argument("--dataset", default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default=default_data_root())
@@ -649,12 +870,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--teacher-baseline-dir", type=str, default="")
 
     parser.add_argument("--clusters-per-class", type=float, default=100.0)
+    parser.add_argument("--distill-method", type=str, default="clvq", choices=["clvq", "random", "kmeans"])
     parser.add_argument("--clvq-gamma0", type=float, default=0.5)
     parser.add_argument("--clvq-alpha", type=float, default=0.6)
     parser.add_argument("--clvq-max-iter", type=int, default=10000)
     parser.add_argument("--clvq-tol", type=float, default=1e-5)
     parser.add_argument("--clvq-check-interval", type=int, default=500)
     parser.add_argument("--clvq-medoid-anchor", type=float, default=0.0)
+    parser.add_argument("--kmeans-max-iter", type=int, default=300)
     parser.add_argument("--weight-count-power", type=float, default=0.5)
 
     parser.add_argument("--encode-batch-size", type=int, default=64)

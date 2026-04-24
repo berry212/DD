@@ -25,6 +25,8 @@ else
   fi
 fi
 IPC="${IPC:-100}"
+DISTILL_METHOD="${DISTILL_METHOD:-clvq}"
+KMEANS_MAX_ITER="${KMEANS_MAX_ITER:-300}"
 TEACHER_BACKBONE="${TEACHER_BACKBONE:-resnet50}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_distill_ipc${IPC}}"
@@ -91,6 +93,8 @@ uv run run-distillation \
   --lora-scale 0.9 \
   --guidance-scale "$GUIDANCE_SCALE" \
   --clusters-per-class "$IPC" \
+  --distill-method "$DISTILL_METHOD" \
+  --kmeans-max-iter "$KMEANS_MAX_ITER" \
   --clvq-medoid-anchor "$CLVQ_MEDOID_ANCHOR" \
   --weight-count-power "$WEIGHT_COUNT_POWER" \
   --teacher-backbone "$TEACHER_BACKBONE" \
