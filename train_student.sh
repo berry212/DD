@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ✅ 新增：安全浮点数比较函数
+float_le() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'
+}
+
 DATASET="${DATASET:-dermamnist}"
 DATASET="$(echo "$DATASET" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-if [[ "$DATASET" == "odir5k" ]]; then
-  DATASET="odir-5k"
+if [[ "$DATASET" == "odir5k" ]]; then DATASET="odir-5k"
 fi
 if [[ "$DATASET" == "aptos" || "$DATASET" == "aptos2019" || "$DATASET" == "aptos-2019" ]]; then
   DATASET="aptos-2019-blindness-detection"
@@ -19,23 +23,15 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_student_ipc${IPC}}"
 
 if [[ -z "${TRAIN_BATCH_SIZE:-}" ]]; then
   case "${BACKBONE}" in
-    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
-      TRAIN_BATCH_SIZE="32"
-      ;;
-    *)
-      TRAIN_BATCH_SIZE="64"
-      ;;
+    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224) TRAIN_BATCH_SIZE="32" ;;
+    *) TRAIN_BATCH_SIZE="64" ;;
   esac
 fi
 
 if [[ -z "${EVAL_BATCH_SIZE:-}" ]]; then
   case "${BACKBONE}" in
-    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
-      EVAL_BATCH_SIZE="64"
-      ;;
-    *)
-      EVAL_BATCH_SIZE="128"
-      ;;
+    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224) EVAL_BATCH_SIZE="64" ;;
+    *) EVAL_BATCH_SIZE="128" ;;
   esac
 fi
 
@@ -43,17 +39,15 @@ if [[ "$DATASET" == "aptos-2019-blindness-detection" ]]; then
   if [[ ! -f "$DATA_ROOT/train.csv" || ! -d "$DATA_ROOT/train_images" ]]; then
     if [[ ! -f "$DATA_ROOT/APTOS_2019_Blindness_Detection/train.csv" || ! -d "$DATA_ROOT/APTOS_2019_Blindness_Detection/train_images" ]]; then
       echo "[ERROR] APTOS-2019 dataset directory not found under DATA_ROOT: $DATA_ROOT"
-      echo "[ERROR] Expected either:"
-      echo "[ERROR]   - $DATA_ROOT/train.csv and $DATA_ROOT/train_images"
-      echo "[ERROR]   - $DATA_ROOT/APTOS_2019_Blindness_Detection/train.csv and train_images"
       exit 1
     fi
   fi
 fi
 
+# ✅ 修复：KD_TEMPERATURE 判断
 if [[ -z "${KD_TEMPERATURE:-}" ]]; then
   if [[ "$DATASET" == "dermamnist" ]]; then
-    if [[ "$IPC" -le 100 ]]; then
+    if float_le "$IPC" 100; then
       KD_TEMPERATURE="1.5"
     else
       KD_TEMPERATURE="2.0"
@@ -64,24 +58,21 @@ if [[ -z "${KD_TEMPERATURE:-}" ]]; then
 fi
 
 if [[ -z "${HARD_LABEL_ALPHA:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then
-    HARD_LABEL_ALPHA="0.35"
-  else
-    HARD_LABEL_ALPHA="0.0"
+  if [[ "$DATASET" == "dermamnist" ]]; then HARD_LABEL_ALPHA="0.35"
+  else HARD_LABEL_ALPHA="0.0"
   fi
 fi
 
 if [[ -z "${WEIGHT_BALANCE_ALPHA:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then
-    WEIGHT_BALANCE_ALPHA="0.35"
-  else
-    WEIGHT_BALANCE_ALPHA="0.0"
+  if [[ "$DATASET" == "dermamnist" ]]; then WEIGHT_BALANCE_ALPHA="0.35"
+  else WEIGHT_BALANCE_ALPHA="0.0"
   fi
 fi
 
+# ✅ 修复：SOFT_LABEL_SHARPEN 判断
 if [[ -z "${SOFT_LABEL_SHARPEN:-}" ]]; then
   if [[ "$DATASET" == "dermamnist" ]]; then
-    if [[ "$IPC" -le 100 ]]; then
+    if float_le "$IPC" 100; then
       SOFT_LABEL_SHARPEN="0.9"
     else
       SOFT_LABEL_SHARPEN="0.85"

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ✅ 新增：安全浮点数比较函数 (替代 Bash 原生 -le/-gt)
+float_le() {
+  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'
+}
+
 DATASET="${DATASET:-dermamnist}"
 DATASET="$(echo "$DATASET" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
 if [[ "$DATASET" == "odir5k" ]]; then
@@ -28,32 +33,27 @@ GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.0}"
 SDE_STEPS="${SDE_STEPS:-200}"
 
 if [[ -z "${TEACHER_TEMPERATURE:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then
-    TEACHER_TEMPERATURE="8.0"
-  else
-    TEACHER_TEMPERATURE="20.0"
+  if [[ "$DATASET" == "dermamnist" ]]; then TEACHER_TEMPERATURE="8.0"
+  else TEACHER_TEMPERATURE="20.0"
   fi
 fi
 
 if [[ -z "${SDE_NOISE_STRENGTH:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then
-    SDE_NOISE_STRENGTH="0.1"
-  else
-    SDE_NOISE_STRENGTH="0.2"
+  if [[ "$DATASET" == "dermamnist" ]]; then SDE_NOISE_STRENGTH="0.1"
+  else SDE_NOISE_STRENGTH="0.2"
   fi
 fi
 
 if [[ -z "${CLVQ_MEDOID_ANCHOR:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then
-    CLVQ_MEDOID_ANCHOR="0.65"
-  else
-    CLVQ_MEDOID_ANCHOR="0.0"
+  if [[ "$DATASET" == "dermamnist" ]]; then CLVQ_MEDOID_ANCHOR="0.65"
+  else CLVQ_MEDOID_ANCHOR="0.0"
   fi
 fi
 
+# ✅ 修复：使用 float_le 替代 [[ "$IPC" -le 100 ]]
 if [[ -z "${WEIGHT_COUNT_POWER:-}" ]]; then
   if [[ "$DATASET" == "dermamnist" ]]; then
-    if [[ "$IPC" -le 100 ]]; then
+    if float_le "$IPC" 100; then
       WEIGHT_COUNT_POWER="0.4"
     else
       WEIGHT_COUNT_POWER="0.5"
@@ -72,13 +72,13 @@ if [[ "$DATASET" == "aptos-2019-blindness-detection" ]]; then
   if [[ ! -f "$DATA_ROOT/train.csv" || ! -d "$DATA_ROOT/train_images" ]]; then
     if [[ ! -f "$DATA_ROOT/APTOS_2019_Blindness_Detection/train.csv" || ! -d "$DATA_ROOT/APTOS_2019_Blindness_Detection/train_images" ]]; then
       echo "[ERROR] APTOS-2019 dataset directory not found under DATA_ROOT: $DATA_ROOT"
-      echo "[ERROR] Expected either:"
-      echo "[ERROR]   - $DATA_ROOT/train.csv and $DATA_ROOT/train_images"
-      echo "[ERROR]   - $DATA_ROOT/APTOS_2019_Blindness_Detection/train.csv and train_images"
       exit 1
     fi
   fi
 fi
+
+CLVQ_MEDOID_ANCHOR="0.0"
+WEIGHT_COUNT_POWER="1.0"
 
 uv run run-distillation \
   --dataset "$DATASET" \
@@ -99,10 +99,10 @@ uv run run-distillation \
   --sde-steps "$SDE_STEPS" \
   --sde-noise-strength "$SDE_NOISE_STRENGTH" \
   --encode-batch-size 32 \
-  --decode-batch-size 16 \
+  --decode-batch-size 32 \
   --fp16 \
   "$@"
 
 echo "[INFO] Distillation finished."
-echo "[INFO] Teacher baseline folder: ${BASELINE_DIR} (metrics: teacher_baseline_metrics.json)"
+echo "[INFO] Teacher baseline folder: ${BASELINE_DIR}"
 echo "[INFO] Train student with: uv run run-train-distilled-student --dataset ${DATASET} --data-root ${DATA_ROOT} --distilled-data ${OUTPUT_DIR}/distilled_data.pt --output-dir outputs/${DATASET}_224_student_ipc${IPC}"

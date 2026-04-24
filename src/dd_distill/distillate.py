@@ -181,7 +181,7 @@ def anchor_centers_to_medoids(
 def classwise_clvq(
     latents: torch.Tensor,
     labels: torch.Tensor,
-    clusters_per_class: int,
+    clusters_per_class: float,
     num_classes: int,
     seed: int,
     gamma_0: float,
@@ -194,6 +194,9 @@ def classwise_clvq(
 ) -> CLVQResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
+
+    ipc = float(clusters_per_class)
+    ipc_is_integer = float(ipc).is_integer()
 
     medoid_anchor = float(np.clip(medoid_anchor, 0.0, 1.0))
     check_interval = max(1, int(check_interval))
@@ -218,7 +221,12 @@ def classwise_clvq(
             warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
             continue
 
-        class_k = min(clusters_per_class, class_samples)
+        if ipc_is_integer:
+            target_k = int(ipc)
+        else:
+            target_k = int(round(class_samples * ipc))
+
+        class_k = max(1, min(target_k, class_samples))
         class_seed = seed + 1009 * (class_id + 1)
         centers = initialize_clvq_centers(class_latents, class_k, class_seed)
         running_weights = np.full((class_k,), fill_value=1.0 / float(class_k), dtype=np.float64)
@@ -273,7 +281,8 @@ def classwise_clvq(
         count_chunks.append(torch.from_numpy(counts))
 
         print(
-            f"[CLVQ-Class] class={class_id} samples={class_samples} kept={centers.shape[0]} "
+            f"[CLVQ-Class] class={class_id} samples={class_samples} "
+            f"target_k={target_k} used={class_k} kept={centers.shape[0]} "
             f"medoid_anchor={medoid_anchor:.2f}"
         )
 
@@ -612,7 +621,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_baseline_dir": str(teacher_baseline_dir),
         "num_classes": int(num_classes),
         "clvq_mode": "class-wise-clvq",
-        "clusters_per_class": int(args.clusters_per_class),
+        "clusters_per_class": float(args.clusters_per_class),
         "clvq_medoid_anchor": float(args.clvq_medoid_anchor),
         "num_distilled": int(distilled_images.size(0)),
         "teacher_backbone": str(args.teacher_backbone),
@@ -639,7 +648,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--teacher-baseline-dir", type=str, default="")
 
-    parser.add_argument("--clusters-per-class", type=int, default=100)
+    parser.add_argument("--clusters-per-class", type=float, default=100.0)
     parser.add_argument("--clvq-gamma0", type=float, default=0.5)
     parser.add_argument("--clvq-alpha", type=float, default=0.6)
     parser.add_argument("--clvq-max-iter", type=int, default=10000)
