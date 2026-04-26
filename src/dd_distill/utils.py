@@ -2,6 +2,7 @@ import json
 import os
 import random
 import warnings
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
 import warnings
@@ -74,29 +75,54 @@ def save_preview_grid(images: torch.Tensor, output_path: Path, max_images: int =
     Image.fromarray(grid_np).save(output_path)
 
 
-def save_distilled_images(images: torch.Tensor, labels: torch.Tensor, output_dir: Path) -> list[str]:
+def _write_png(abs_path: Path, image_np: np.ndarray) -> None:
+    Image.fromarray(image_np).save(abs_path)
+
+
+def save_distilled_images(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    output_dir: Path,
+    start_index: int = 0,
+    max_workers: int = 0,
+) -> list[str]:
     image_root = output_dir / "distilled_images"
     image_root.mkdir(parents=True, exist_ok=True)
 
+    worker_count = max(0, int(max_workers))
+    executor: ThreadPoolExecutor | None = None
+    futures: list[Future[None]] = []
+    if worker_count > 1:
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+
     rel_paths: list[str] = []
     for idx in range(images.size(0)):
+        global_idx = int(start_index + idx)
         class_id = int(labels[idx].item())
         class_dir = image_root / f"class_{class_id}"
         class_dir.mkdir(parents=True, exist_ok=True)
 
-        rel_path = Path(f"class_{class_id}") / f"sample_{idx:05d}.png"
+        rel_path = Path(f"class_{class_id}") / f"sample_{global_idx:05d}.png"
         abs_path = image_root / rel_path
 
         image_np = (images[idx].permute(1, 2, 0).numpy() * 255.0).clip(0, 255).astype(np.uint8)
-        Image.fromarray(image_np).save(abs_path)
+        if executor is None:
+            _write_png(abs_path, image_np)
+        else:
+            futures.append(executor.submit(_write_png, abs_path, image_np))
         rel_paths.append(str(rel_path))
+
+    if executor is not None:
+        for f in futures:
+            f.result()
+        executor.shutdown(wait=True)
 
     return rel_paths
 
 
 def save_distillation_artifacts(
     output_dir: Path,
-    images: torch.Tensor,
+    images: torch.Tensor | None,
     weights: torch.Tensor,
     soft_labels: torch.Tensor,
     center_labels: torch.Tensor,
@@ -104,28 +130,37 @@ def save_distillation_artifacts(
     saved_paths: list[str],
     dataset_name: str,
     lora_path: str,
+    image_shards: list[str] | None = None,
+    store_images_in_pt: bool = True,
 ) -> None:
-    # Keep only the triplet required by downstream training.
-    torch.save(
-        {
-            "images": images,
-            "weights": weights,
-            "soft_labels": soft_labels,
-            "dataset": dataset_name,
-            "lora_path": lora_path,
-        },
-        output_dir / "distilled_data.pt",
-    )
+    payload: dict[str, object] = {
+        "weights": weights.float().cpu(),
+        "soft_labels": soft_labels.float().cpu(),
+        "dataset": dataset_name,
+        "lora_path": lora_path,
+        "image_relative_paths": list(saved_paths),
+    }
+    if image_shards:
+        payload["image_shards"] = list(image_shards)
+    if store_images_in_pt and images is not None:
+        payload["images"] = images.float().cpu()
+
+    torch.save(payload, output_dir / "distilled_data.pt")
+
+    num_distilled = int(soft_labels.size(0))
+    if images is not None:
+        num_distilled = int(images.size(0))
 
     metadata = {
         "dataset": dataset_name,
         "lora_path": lora_path,
-        "num_distilled": int(images.size(0)),
+        "num_distilled": num_distilled,
         "weights_sum": float(weights.sum().item()),
         "soft_labels_shape": list(soft_labels.shape),
         "center_labels": [int(v) for v in center_labels.tolist()],
         "cluster_counts": [int(v) for v in counts.tolist()],
         "image_relative_paths": saved_paths,
+        "image_shards": list(image_shards or []),
     }
     with open(output_dir / "distilled_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)

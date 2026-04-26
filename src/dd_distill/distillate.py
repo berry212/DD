@@ -5,7 +5,7 @@ import json
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import torch
@@ -360,6 +360,37 @@ def gather_images_by_indices(
     return torch.stack(images, dim=0), torch.stack(labels, dim=0).long()
 
 
+def iter_images_by_indices(
+    train_set: Any,
+    indices: torch.Tensor,
+    image_size: int,
+    batch_size: int,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    indices_np = indices.long().cpu().numpy().astype(np.int64, copy=False)
+    if indices_np.size == 0:
+        raise ValueError("iter_images_by_indices expects at least one index.")
+
+    chunk_size = max(1, int(batch_size))
+    image_transform = transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ]
+    )
+    dataset = TorchDataset(train_set, transform=image_transform)
+
+    for start in range(0, indices_np.size, chunk_size):
+        end = min(indices_np.size, start + chunk_size)
+        images: list[torch.Tensor] = []
+        labels: list[torch.Tensor] = []
+        for raw_idx in indices_np[start:end].tolist():
+            image_t, label_t = dataset[int(raw_idx)]
+            images.append(image_t)
+            labels.append(label_t)
+        yield torch.stack(images, dim=0), torch.stack(labels, dim=0).long()
+
+
 def classwise_clvq(
     latents: torch.Tensor,
     labels: torch.Tensor,
@@ -623,6 +654,21 @@ class ReverseSDEDecoder:
             print(f"[Decoding] {end}/{total}")
         return torch.cat(chunks, dim=0)
 
+    @torch.no_grad()
+    def decode_batches(
+        self,
+        centers: torch.Tensor,
+        labels: torch.Tensor,
+        batch_size: int,
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        total = centers.size(0)
+        chunk_size = max(1, int(batch_size))
+        for start in range(0, total, chunk_size):
+            end = min(total, start + chunk_size)
+            imgs = self._decode_batch(centers[start:end], labels[start:end])
+            print(f"[Decoding] {end}/{total}")
+            yield imgs.float().cpu(), labels[start:end].long().cpu()
+
     def cleanup(self) -> None:
         del self.pipe
         if torch.cuda.is_available():
@@ -726,6 +772,10 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     else:
         latents, latent_labels = cached_latents
 
+    stream_batch_size = max(1, int(args.save_batch_size))
+
+    decoder: ReverseSDEDecoder | None = None
+
     if args.distill_method == "clvq":
         clvq = classwise_clvq(
             latents=latents,
@@ -756,10 +806,11 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             guidance_scale=args.guidance_scale,
         )
 
-        try:
-            distilled_images = decoder.decode(clvq.centers, clvq.center_labels, args.decode_batch_size)
-        finally:
-            decoder.cleanup()
+        stream_iter = decoder.decode_batches(
+            clvq.centers,
+            clvq.center_labels,
+            batch_size=min(stream_batch_size, max(1, int(args.decode_batch_size))),
+        )
 
         distilled_labels = clvq.center_labels
         distilled_counts = clvq.counts
@@ -772,14 +823,14 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             seed=args.seed,
             weight_count_power=args.weight_count_power,
         )
-        distilled_images, gathered_labels = gather_images_by_indices(
+        expected_labels = selected.labels.long().cpu()
+        stream_iter = iter_images_by_indices(
             train_set=train_set,
             indices=selected.indices,
             image_size=args.image_size,
+            batch_size=stream_batch_size,
         )
-        if not torch.equal(gathered_labels.cpu(), selected.labels.cpu()):
-            warnings.warn("Gathered labels mismatch selected labels; using gathered labels.", RuntimeWarning)
-        distilled_labels = gathered_labels.long().cpu()
+        distilled_labels = expected_labels
         distilled_counts = selected.counts
         distilled_weights = selected.weights
     elif args.distill_method == "kmeans":
@@ -792,33 +843,108 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             weight_count_power=args.weight_count_power,
             kmeans_max_iter=args.kmeans_max_iter,
         )
-        distilled_images, gathered_labels = gather_images_by_indices(
+        expected_labels = selected.labels.long().cpu()
+        stream_iter = iter_images_by_indices(
             train_set=train_set,
             indices=selected.indices,
             image_size=args.image_size,
+            batch_size=stream_batch_size,
         )
-        if not torch.equal(gathered_labels.cpu(), selected.labels.cpu()):
-            warnings.warn("Gathered labels mismatch selected labels; using gathered labels.", RuntimeWarning)
-        distilled_labels = gathered_labels.long().cpu()
+        distilled_labels = expected_labels
         distilled_counts = selected.counts
         distilled_weights = selected.weights
     else:
         raise ValueError(f"Unsupported distill method: {args.distill_method}")
 
-    soft_labels = make_teacher_soft_labels(
-        teacher=teacher,
-        distilled_images=distilled_images,
-        temperature=args.teacher_temperature,
-        batch_size=args.eval_batch_size,
-        device=device,
-    )
+    saved_paths: list[str] = []
+    shard_paths: list[str] = []
+    soft_label_chunks: list[torch.Tensor] = []
+    preview_chunks: list[torch.Tensor] = []
+    image_chunks: list[torch.Tensor] = []
+    preview_budget = 100
+    cursor = 0
+    shard_root = output_dir / "distilled_shards"
+    shard_root.mkdir(parents=True, exist_ok=True)
 
-    save_preview_grid(distilled_images, output_dir / "distilled_preview.png")
-    saved_paths = save_distilled_images(distilled_images, distilled_labels, output_dir)
+    try:
+        for batch_idx, (image_batch, label_batch) in enumerate(stream_iter, start=1):
+            image_batch = image_batch.float().cpu()
+            label_batch = label_batch.long().cpu()
+            batch_n = int(image_batch.size(0))
+
+            if args.distill_method in {"random", "kmeans"}:
+                expected = expected_labels[cursor : cursor + batch_n]
+                if not torch.equal(label_batch, expected):
+                    warnings.warn(
+                        f"Gathered labels mismatch selected labels in batch {batch_idx}; using gathered labels.",
+                        RuntimeWarning,
+                    )
+                    distilled_labels[cursor : cursor + batch_n] = label_batch
+
+            soft_batch = make_teacher_soft_labels(
+                teacher=teacher,
+                distilled_images=image_batch,
+                temperature=args.teacher_temperature,
+                batch_size=args.eval_batch_size,
+                device=device,
+            )
+            soft_label_chunks.append(soft_batch)
+
+            rel_paths = save_distilled_images(
+                images=image_batch,
+                labels=label_batch,
+                output_dir=output_dir,
+                start_index=cursor,
+                max_workers=args.save_async_workers,
+            )
+            saved_paths.extend(rel_paths)
+
+            shard_rel = str(Path("distilled_shards") / f"shard_{len(shard_paths):05d}.pt")
+            shard_abs = output_dir / shard_rel
+            torch.save(
+                {
+                    "images": (image_batch * 255.0).clamp(0.0, 255.0).to(torch.uint8),
+                    "labels": label_batch,
+                    "weights": distilled_weights[cursor : cursor + batch_n].float().cpu(),
+                    "soft_labels": soft_batch.float().cpu(),
+                    "start_index": int(cursor),
+                    "end_index": int(cursor + batch_n),
+                },
+                shard_abs,
+            )
+            shard_paths.append(shard_rel)
+
+            if preview_budget > 0:
+                keep_n = min(preview_budget, batch_n)
+                preview_chunks.append(image_batch[:keep_n])
+                preview_budget -= keep_n
+
+            if bool(args.store_images_in_pt):
+                image_chunks.append(image_batch)
+
+            cursor += batch_n
+            print(f"[Save] batch={batch_idx} saved={cursor}/{distilled_labels.size(0)}")
+    finally:
+        if decoder is not None:
+            decoder.cleanup()
+
+    if cursor != int(distilled_labels.size(0)):
+        raise RuntimeError(
+            f"Saved sample count mismatch: saved={cursor} expected={int(distilled_labels.size(0))}"
+        )
+
+    soft_labels = torch.cat(soft_label_chunks, dim=0)
+    if preview_chunks:
+        preview_images = torch.cat(preview_chunks, dim=0)
+        save_preview_grid(preview_images, output_dir / "distilled_preview.png")
+
+    distilled_images_for_pt: torch.Tensor | None = None
+    if bool(args.store_images_in_pt):
+        distilled_images_for_pt = torch.cat(image_chunks, dim=0)
 
     save_distillation_artifacts(
         output_dir=output_dir,
-        images=distilled_images,
+        images=distilled_images_for_pt,
         weights=distilled_weights,
         soft_labels=soft_labels,
         center_labels=distilled_labels,
@@ -826,6 +952,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         saved_paths=saved_paths,
         dataset_name=dataset_spec.name,
         lora_path=resolved_lora_path,
+        image_shards=shard_paths,
+        store_images_in_pt=bool(args.store_images_in_pt),
     )
 
     del vae
@@ -841,7 +969,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "clusters_per_class": float(args.clusters_per_class),
         "clvq_medoid_anchor": float(args.clvq_medoid_anchor),
         "kmeans_max_iter": int(args.kmeans_max_iter),
-        "num_distilled": int(distilled_images.size(0)),
+        "num_distilled": int(cursor),
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
         "weight_count_power": float(args.weight_count_power),
@@ -882,6 +1010,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--encode-batch-size", type=int, default=64)
     parser.add_argument("--decode-batch-size", type=int, default=32)
+    parser.add_argument("--save-batch-size", type=int, default=64)
+    parser.add_argument("--save-async-workers", type=int, default=0)
+    parser.add_argument("--store-images-in-pt", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--diffusion-model-id", type=str, default="runwayml/stable-diffusion-v1-5")

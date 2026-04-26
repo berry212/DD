@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from torchvision.models import ResNet50_Weights, resnet50
@@ -66,9 +67,51 @@ def _load_payload(path: Path) -> dict[str, Any]:
     payload = torch.load(path, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError(f"Invalid distilled payload type: {type(payload)}")
-    if "images" not in payload:
-        raise KeyError(f"Missing 'images' in {path}")
     return payload
+
+
+def _load_images_from_payload(payload: dict[str, Any], distilled_data_path: Path) -> torch.Tensor:
+    images = payload.get("images")
+    if isinstance(images, torch.Tensor):
+        return images.float()
+
+    image_shards = payload.get("image_shards")
+    if isinstance(image_shards, list) and image_shards:
+        image_chunks: list[torch.Tensor] = []
+        for rel_shard in image_shards:
+            shard_path = distilled_data_path.parent / str(rel_shard)
+            shard_payload = torch.load(shard_path, map_location="cpu")
+            shard_images = shard_payload.get("images")
+            if not isinstance(shard_images, torch.Tensor):
+                raise ValueError(f"Missing tensor 'images' in shard: {shard_path}")
+            shard_t = shard_images.float()
+            if shard_t.max().item() > 1.0:
+                shard_t = shard_t / 255.0
+            image_chunks.append(shard_t)
+        return torch.cat(image_chunks, dim=0)
+
+    rel_paths = payload.get("image_relative_paths")
+    if isinstance(rel_paths, list) and rel_paths:
+        image_chunks = []
+        for rel_path in rel_paths:
+            rel_str = str(rel_path)
+            cand_a = distilled_data_path.parent / "distilled_images" / rel_str
+            cand_b = distilled_data_path.parent / rel_str
+            abs_path = cand_a if cand_a.exists() else cand_b
+            if not abs_path.exists():
+                raise FileNotFoundError(f"Distilled image file not found: {cand_a} or {cand_b}")
+
+            with Image.open(abs_path) as pil_img:
+                img_np = np.asarray(pil_img, dtype=np.float32)
+            if img_np.ndim == 2:
+                img_np = img_np[:, :, None]
+            img_t = torch.from_numpy(img_np).permute(2, 0, 1).contiguous() / 255.0
+            image_chunks.append(img_t)
+        return torch.stack(image_chunks, dim=0)
+
+    raise KeyError(
+        "Missing images in distilled payload. Expected one of: 'images', 'image_shards', 'image_relative_paths'."
+    )
 
 
 def _labels_from_metadata(metadata_path: Path, expected_size: int) -> np.ndarray | None:
@@ -372,9 +415,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     payload = _load_payload(distilled_data_path)
-    images = payload["images"]
-    if not isinstance(images, torch.Tensor):
-        raise ValueError(f"images must be torch.Tensor, got {type(images)}")
+    images = _load_images_from_payload(payload, distilled_data_path)
 
     total_samples = int(images.size(0))
     labels, label_source_used = _resolve_labels(

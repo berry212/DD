@@ -6,6 +6,7 @@ import os
 import random
 from pathlib import Path
 from typing import Any, override
+from PIL import Image
 
 import numpy as np
 import torch
@@ -109,12 +110,55 @@ def load_distilled_triplet(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str, str]:
     payload = torch.load(distilled_data_path, map_location="cpu")
 
-    required = {"images", "weights", "soft_labels"}
+    required = {"weights", "soft_labels"}
     missing = [k for k in required if k not in payload]
     if missing:
         raise KeyError(f"Missing keys in {distilled_data_path}: {missing}")
 
-    images = payload["images"].float()
+    images_obj = payload.get("images")
+    images: torch.Tensor
+    if isinstance(images_obj, torch.Tensor):
+        images = images_obj.float()
+    else:
+        image_shards = payload.get("image_shards")
+        if isinstance(image_shards, list) and image_shards:
+            image_chunks: list[torch.Tensor] = []
+            for rel_shard in image_shards:
+                shard_path = distilled_data_path.parent / str(rel_shard)
+                shard_payload = torch.load(shard_path, map_location="cpu")
+                shard_images = shard_payload.get("images")
+                if not isinstance(shard_images, torch.Tensor):
+                    raise ValueError(f"Missing tensor 'images' in shard: {shard_path}")
+                shard_t = shard_images.float()
+                if shard_t.max().item() > 1.0:
+                    shard_t = shard_t / 255.0
+                image_chunks.append(shard_t)
+            images = torch.cat(image_chunks, dim=0)
+        else:
+            rel_paths = payload.get("image_relative_paths")
+            if not isinstance(rel_paths, list) or not rel_paths:
+                raise KeyError(
+                    "Missing images in distilled payload. Expected one of: 'images', 'image_shards', 'image_relative_paths'."
+                )
+
+            image_chunks = []
+            for rel_path in rel_paths:
+                rel_str = str(rel_path)
+                cand_a = distilled_data_path.parent / "distilled_images" / rel_str
+                cand_b = distilled_data_path.parent / rel_str
+                abs_path = cand_a if cand_a.exists() else cand_b
+                if not abs_path.exists():
+                    raise FileNotFoundError(f"Distilled image file not found: {cand_a} or {cand_b}")
+
+                with Image.open(abs_path) as pil_img:
+                    img_np = np.asarray(pil_img, dtype=np.float32)
+                if img_np.ndim == 2:
+                    img_np = img_np[:, :, None]
+                img_t = torch.from_numpy(img_np).permute(2, 0, 1).contiguous() / 255.0
+                image_chunks.append(img_t)
+
+            images = torch.stack(image_chunks, dim=0)
+
     weights = payload["weights"].float().view(-1)
     soft_labels = payload["soft_labels"].float()
     distilled_dataset = str(payload.get("dataset", "")).strip().lower()
