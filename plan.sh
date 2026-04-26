@@ -8,9 +8,19 @@ DATASET="${DATASET:-dermamnist}"
 
 # DATASET=$DATASET DATA_ROOT=data bash lora_finetune.sh
 
-for IPC in 0.2 0.4 0.6 0.8; do
-    DISTILL_METHOD=random DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
-    DISTILL_METHOD=random DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
+# for IPC in 0.2 0.4 0.6 0.8; do
+#     DISTILL_METHOD=random DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
+#     DISTILL_METHOD=random DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
+# done
+
+# for IPC in 0.6; do
+#     DISTILL_METHOD=kmeans DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
+#     DISTILL_METHOD=kmeans DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
+# done
+
+for IPC in 0.2 0.4 0.6; do
+    DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
+    DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
 done
 
 # DATASET="bloodmnist"

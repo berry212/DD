@@ -5,11 +5,11 @@ import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
-import warnings
-import functools
 
 import numpy as np
 import torch
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 from torchvision.utils import make_grid
 
 
@@ -20,6 +20,77 @@ def normalize_batch(images: torch.Tensor) -> torch.Tensor:
     mean = IMAGENET_MEAN.to(device=images.device, dtype=images.dtype)
     std = IMAGENET_STD.to(device=images.device, dtype=images.dtype)
     return (images - mean) / std
+
+
+def sample_random_resized_crop_params(
+    image_height: int,
+    image_width: int,
+    scale: tuple[float, float],
+    ratio: tuple[float, float] = (3.0 / 4.0, 4.0 / 3.0),
+    generator: torch.Generator | None = None,
+) -> tuple[int, int, int, int]:
+    height = int(max(1, image_height))
+    width = int(max(1, image_width))
+    area = float(height * width)
+
+    scale_min = float(np.clip(scale[0], 1e-4, 1.0))
+    scale_max = float(np.clip(scale[1], scale_min, 1.0))
+    ratio_min = float(max(ratio[0], 1e-4))
+    ratio_max = float(max(ratio[1], ratio_min))
+    log_ratio_min = float(np.log(ratio_min))
+    log_ratio_max = float(np.log(ratio_max))
+
+    for _ in range(10):
+        target_area = area * float(
+            torch.empty(1).uniform_(scale_min, scale_max, generator=generator).item()
+        )
+        aspect_ratio = float(
+            torch.empty(1).uniform_(log_ratio_min, log_ratio_max, generator=generator).exp_().item()
+        )
+
+        crop_width = int(round(np.sqrt(target_area * aspect_ratio)))
+        crop_height = int(round(np.sqrt(target_area / aspect_ratio)))
+        if 0 < crop_width <= width and 0 < crop_height <= height:
+            top = int(torch.randint(0, height - crop_height + 1, (1,), generator=generator).item())
+            left = int(torch.randint(0, width - crop_width + 1, (1,), generator=generator).item())
+            return top, left, crop_height, crop_width
+
+    in_ratio = float(width / height)
+    if in_ratio < ratio_min:
+        crop_width = width
+        crop_height = int(round(crop_width / ratio_min))
+    elif in_ratio > ratio_max:
+        crop_height = height
+        crop_width = int(round(crop_height * ratio_max))
+    else:
+        crop_height = height
+        crop_width = width
+
+    top = max((height - crop_height) // 2, 0)
+    left = max((width - crop_width) // 2, 0)
+    return top, left, crop_height, crop_width
+
+
+def apply_resized_crop_with_flip(
+    image: torch.Tensor,
+    crop_params: tuple[int, int, int, int],
+    output_size: int,
+    horizontal_flip: bool = False,
+) -> torch.Tensor:
+    top, left, crop_height, crop_width = (int(v) for v in crop_params)
+    cropped = TF.resized_crop(
+        image.float(),
+        top=top,
+        left=left,
+        height=max(1, crop_height),
+        width=max(1, crop_width),
+        size=[int(output_size), int(output_size)],
+        interpolation=InterpolationMode.BILINEAR,
+        antialias=True,
+    )
+    if bool(horizontal_flip):
+        cropped = TF.hflip(cropped)
+    return cropped.clamp(0.0, 1.0)
 
 
 def default_data_root() -> str:
@@ -130,20 +201,28 @@ def save_distillation_artifacts(
     saved_paths: list[str],
     dataset_name: str,
     lora_path: str,
+    teacher_temperature: float = 0.0,
     image_shards: list[str] | None = None,
     store_images_in_pt: bool = True,
+    fkd_batch_path: str = "",
+    fkd_batch_summary: dict[str, object] | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "weights": weights.float().cpu(),
         "soft_labels": soft_labels.float().cpu(),
         "dataset": dataset_name,
         "lora_path": lora_path,
+        "teacher_temperature": float(teacher_temperature),
         "image_relative_paths": list(saved_paths),
     }
     if image_shards:
         payload["image_shards"] = list(image_shards)
     if store_images_in_pt and images is not None:
         payload["images"] = images.float().cpu()
+    if fkd_batch_path:
+        payload["fkd_batch_path"] = str(fkd_batch_path)
+    if fkd_batch_summary:
+        payload["fkd_batch_summary"] = dict(fkd_batch_summary)
 
     torch.save(payload, output_dir / "distilled_data.pt")
 
@@ -154,6 +233,7 @@ def save_distillation_artifacts(
     metadata = {
         "dataset": dataset_name,
         "lora_path": lora_path,
+        "teacher_temperature": float(teacher_temperature),
         "num_distilled": num_distilled,
         "weights_sum": float(weights.sum().item()),
         "soft_labels_shape": list(soft_labels.shape),
@@ -161,6 +241,8 @@ def save_distillation_artifacts(
         "cluster_counts": [int(v) for v in counts.tolist()],
         "image_relative_paths": saved_paths,
         "image_shards": list(image_shards or []),
+        "fkd_batch_path": str(fkd_batch_path),
+        "fkd_batch_summary": dict(fkd_batch_summary or {}),
     }
     with open(output_dir / "distilled_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)

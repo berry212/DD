@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, MiniBatchKMeans
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -148,11 +148,164 @@ def target_count_for_class(class_samples: int, ipc: float) -> int:
     return max(1, min(target_k, class_samples))
 
 
-def counts_to_weights(counts_t: torch.Tensor, count_power: float) -> torch.Tensor:
-    count_power = float(max(count_power, 1e-6))
-    count_signal_t = counts_t.float().clamp_min(1.0).pow(count_power)
-    count_weights_t = count_signal_t / count_signal_t.sum().clamp_min(1e-12)
-    return count_weights_t / count_weights_t.sum().clamp_min(1e-12)
+def compute_classwise_cluster_weights(
+    counts_t: torch.Tensor,
+    labels_t: torch.Tensor,
+    num_classes: int,
+    strategy: str,
+) -> torch.Tensor:
+    if counts_t.numel() != labels_t.numel():
+        raise ValueError(
+            f"counts/labels size mismatch: counts={counts_t.numel()} labels={labels_t.numel()}"
+        )
+
+    mode = str(strategy).strip().lower()
+    if mode not in {"heuristic", "direct", "uniform"}:
+        raise ValueError(f"Unsupported weighting strategy: {strategy}")
+
+    labels_l = labels_t.long().view(-1)
+    counts_f = counts_t.float().view(-1).clamp_min(0.0)
+    weights = torch.zeros_like(counts_f)
+
+    for class_id in range(num_classes):
+        mask = labels_l == class_id
+        class_k = int(mask.sum().item())
+        if class_k <= 0:
+            continue
+
+        if mode == "uniform":
+            weights[mask] = 1.0
+            continue
+
+        class_counts = counts_f[mask].clamp_min(1.0)
+        class_mass = class_counts.sum().clamp_min(1e-12)
+        if mode == "direct":
+            # Direct cluster weights: normalized assignment counts in each class.
+            weights[mask] = class_counts / class_mass
+        else:
+            # DDOQ Appendix H Eq.(34): w_k^(L) = K_L * v_k^(L) / sum_j v_j^(L).
+            weights[mask] = float(class_k) * class_counts / class_mass
+
+    return weights
+
+
+def build_epoch_batch_indices(
+    num_samples: int,
+    batch_size: int,
+    generator: torch.Generator,
+) -> torch.Tensor:
+    sample_count = int(max(1, num_samples))
+    batch_n = int(max(1, batch_size))
+    num_batches = max(1, int(np.ceil(sample_count / batch_n)))
+
+    epoch_indices = torch.randperm(sample_count, generator=generator)
+    required = num_batches * batch_n
+    if required > sample_count:
+        extra = torch.randperm(sample_count, generator=generator)[: required - sample_count]
+        epoch_indices = torch.cat([epoch_indices, extra], dim=0)
+
+    return epoch_indices.view(num_batches, batch_n).long()
+
+
+@torch.no_grad()
+def precompute_fkd_batch_cache(
+    teacher: nn.Module,
+    distilled_images: torch.Tensor,
+    image_size: int,
+    batch_size: int,
+    train_epochs: int,
+    crop_min_scale: float,
+    crop_max_scale: float,
+    horizontal_flip_prob: float,
+    soft_label_temperature: float,
+    eval_batch_size: int,
+    device: torch.device,
+    seed: int,
+) -> dict[str, object]:
+    teacher.eval()
+
+    images = distilled_images.float().cpu()
+    num_samples = int(images.size(0))
+    if num_samples <= 0:
+        raise ValueError("FKD precomputation requires at least one distilled image.")
+
+    batch_n = max(1, min(int(batch_size), num_samples))
+    epoch_count = max(1, int(train_epochs))
+    batches_per_epoch = max(1, int(np.ceil(num_samples / batch_n)))
+    total_batches = epoch_count * batches_per_epoch
+
+    min_scale = float(np.clip(crop_min_scale, 1e-4, 1.0))
+    max_scale = float(np.clip(crop_max_scale, min_scale, 1.0))
+    hflip_prob = float(np.clip(horizontal_flip_prob, 0.0, 1.0))
+
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) + 7001)
+
+    batch_indices_chunks: list[torch.Tensor] = []
+    crop_param_chunks: list[torch.Tensor] = []
+    flip_mask_chunks: list[torch.Tensor] = []
+    soft_label_chunks: list[torch.Tensor] = []
+
+    batch_cursor = 0
+    for _epoch in range(epoch_count):
+        epoch_batches = build_epoch_batch_indices(num_samples=num_samples, batch_size=batch_n, generator=generator)
+        for local_batch_indices in epoch_batches:
+            augmented_images: list[torch.Tensor] = []
+            crop_params: list[tuple[int, int, int, int]] = []
+            flip_mask: list[bool] = []
+
+            for sample_idx in local_batch_indices.tolist():
+                image = images[int(sample_idx)]
+                crop = sample_random_resized_crop_params(
+                    image_height=int(image.shape[-2]),
+                    image_width=int(image.shape[-1]),
+                    scale=(min_scale, max_scale),
+                    generator=generator,
+                )
+                do_flip = bool(torch.rand(1, generator=generator).item() < hflip_prob)
+                augmented = apply_resized_crop_with_flip(
+                    image=image,
+                    crop_params=crop,
+                    output_size=image_size,
+                    horizontal_flip=do_flip,
+                )
+                augmented_images.append(augmented)
+                crop_params.append(crop)
+                flip_mask.append(do_flip)
+
+            batch_images = torch.stack(augmented_images, dim=0)
+            batch_soft_labels = make_teacher_soft_labels(
+                teacher=teacher,
+                distilled_images=batch_images,
+                temperature=soft_label_temperature,
+                batch_size=eval_batch_size,
+                device=device,
+            )
+
+            batch_indices_chunks.append(local_batch_indices.long().cpu())
+            crop_param_chunks.append(torch.tensor(crop_params, dtype=torch.int16))
+            flip_mask_chunks.append(torch.tensor(flip_mask, dtype=torch.bool))
+            soft_label_chunks.append(batch_soft_labels.float().cpu())
+
+            batch_cursor += 1
+            if batch_cursor % 20 == 0 or batch_cursor == total_batches:
+                print(f"[FKD] precomputed {batch_cursor}/{total_batches} augmented batches")
+
+    return {
+        "indices": torch.stack(batch_indices_chunks, dim=0).long(),
+        "crop_params": torch.stack(crop_param_chunks, dim=0).to(dtype=torch.int16),
+        "flip_mask": torch.stack(flip_mask_chunks, dim=0).bool(),
+        "soft_labels": torch.stack(soft_label_chunks, dim=0).float(),
+        "batch_size": int(batch_n),
+        "batches_per_epoch": int(batches_per_epoch),
+        "train_epochs": int(epoch_count),
+        "num_batches": int(total_batches),
+        "image_size": int(image_size),
+        "crop_min_scale": float(min_scale),
+        "crop_max_scale": float(max_scale),
+        "horizontal_flip_prob": float(hflip_prob),
+        "seed": int(seed),
+    }
 
 
 def assign_to_centers(data: np.ndarray, centers: np.ndarray, batch_size: int = 2048) -> np.ndarray:
@@ -233,7 +386,7 @@ def classwise_random_selection(
     clusters_per_class: float,
     num_classes: int,
     seed: int,
-    weight_count_power: float,
+    weighting_strategy: str,
 ) -> SelectedSamplesResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
@@ -269,7 +422,12 @@ def classwise_random_selection(
     indices_t = torch.cat(index_chunks, dim=0).long()
     labels_t = torch.cat(label_chunks, dim=0).long()
     counts_t = torch.cat(count_chunks, dim=0).long()
-    weights_t = counts_to_weights(counts_t, weight_count_power)
+    weights_t = compute_classwise_cluster_weights(
+        counts_t=counts_t,
+        labels_t=labels_t,
+        num_classes=num_classes,
+        strategy=weighting_strategy,
+    )
 
     return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
 
@@ -280,7 +438,7 @@ def classwise_kmeans_nearest_selection(
     clusters_per_class: float,
     num_classes: int,
     seed: int,
-    weight_count_power: float,
+    weighting_strategy: str,
     kmeans_max_iter: int,
 ) -> SelectedSamplesResult:
     if clusters_per_class <= 0:
@@ -327,7 +485,12 @@ def classwise_kmeans_nearest_selection(
     indices_t = torch.cat(index_chunks, dim=0).long()
     labels_t = torch.cat(label_chunks, dim=0).long()
     counts_t = torch.cat(count_chunks, dim=0).long()
-    weights_t = counts_to_weights(counts_t, weight_count_power)
+    weights_t = compute_classwise_cluster_weights(
+        counts_t=counts_t,
+        labels_t=labels_t,
+        num_classes=num_classes,
+        strategy=weighting_strategy,
+    )
 
     return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
 
@@ -397,22 +560,24 @@ def classwise_clvq(
     clusters_per_class: float,
     num_classes: int,
     seed: int,
-    gamma_0: float,
-    alpha: float,
     max_iter: int,
     tol: float,
-    check_interval: int,
+    minibatch_size: int,
     medoid_anchor: float,
-    weight_count_power: float,
+    weighting_strategy: str,
 ) -> CLVQResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
 
+    print(
+        "[CLVQ] Using the paper-aligned class-wise clustering path implemented with "
+        "MiniBatchKMeans in latent space."
+    )
+
     ipc = float(clusters_per_class)
 
-    medoid_anchor = float(np.clip(medoid_anchor, 0.0, 1.0))
-    check_interval = max(1, int(check_interval))
-    max_iter = max(1, int(max_iter))
+    minibatch_size = max(32, int(minibatch_size))
+    max_iter = max(10, int(max_iter))
 
     latents = latents.float().cpu()
     labels = labels.long().view(-1).cpu()
@@ -435,35 +600,17 @@ def classwise_clvq(
         target_k = target_count_for_class(class_samples, ipc)
         class_k = target_k
         class_seed = seed + 1009 * (class_id + 1)
-        centers = initialize_clvq_centers(class_latents, class_k, class_seed)
-        running_weights = np.full((class_k,), fill_value=1.0 / float(class_k), dtype=np.float64)
-        rng = np.random.default_rng(class_seed)
-        prev_centers = centers.copy()
-
-        for step in range(max_iter):
-            gamma_t = gamma_0 / ((1.0 + float(step)) ** alpha)
-            sample = class_latents[int(rng.integers(0, class_samples))]
-
-            distances = np.sum((centers - sample[None, :]) ** 2, axis=1)
-            winner = int(np.argmin(distances))
-
-            centers[winner] = (1.0 - gamma_t) * centers[winner] + gamma_t * sample
-
-            running_weights *= 1.0 - gamma_t
-            running_weights[winner] += gamma_t
-
-            if (step + 1) % check_interval == 0 or (step + 1) == max_iter:
-                denom = np.linalg.norm(prev_centers) + 1e-12
-                relative_shift = float(np.linalg.norm(centers - prev_centers) / denom)
-                # print(
-                #     f"[CLVQ-Class] class={class_id} iter={step + 1}/{max_iter} "
-                #     f"relative_shift={relative_shift:.6e}"
-                # )
-                if relative_shift < tol:
-                    break
-                prev_centers = centers.copy()
-
-        assignments = assign_to_centers(class_latents, centers, batch_size=2048)
+        kmeans = MiniBatchKMeans(
+            n_clusters=class_k,
+            random_state=class_seed,
+            batch_size=minibatch_size,
+            max_iter=max_iter,
+            n_init=3,
+            tol=float(max(tol, 1e-8)),
+            reassignment_ratio=0.01,
+        )
+        assignments = kmeans.fit_predict(class_latents)
+        centers = kmeans.cluster_centers_.astype(np.float32, copy=False)
 
         if medoid_anchor > 0.0:
             centers = anchor_centers_to_medoids(
@@ -488,18 +635,23 @@ def classwise_clvq(
         count_chunks.append(torch.from_numpy(counts))
 
         print(
-            f"[CLVQ-Class] class={class_id} samples={class_samples} "
+            f"[CLVQ/MiniBatchKMeans-Class] class={class_id} samples={class_samples} "
             f"target_k={target_k} used={class_k} kept={centers.shape[0]} "
-            f"medoid_anchor={medoid_anchor:.2f}"
+            f"batch_size={minibatch_size} max_iter={max_iter} medoid_anchor={medoid_anchor:.2f}"
         )
 
     if not center_chunks:
-        raise RuntimeError("Class-wise CLVQ failed: no centers produced.")
+        raise RuntimeError("Class-wise MiniBatchKMeans failed: no centers produced.")
 
     centers_t = torch.cat(center_chunks, dim=0)
     labels_t = torch.cat(label_chunks, dim=0)
     counts_t = torch.cat(count_chunks, dim=0)
-    weights_t = counts_to_weights(counts_t, weight_count_power)
+    weights_t = compute_classwise_cluster_weights(
+        counts_t=counts_t,
+        labels_t=labels_t,
+        num_classes=num_classes,
+        strategy=weighting_strategy,
+    )
 
     return CLVQResult(
         centers=centers_t,
@@ -703,22 +855,22 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         f"train={len(train_set)} classes={num_classes} baseline_dir={teacher_baseline_dir} "
         f"lora_path={resolved_lora_path}"
     )
-
-    teacher_ckpt_path = teacher_baseline_dir / "teacher_best.pt"
-    try:
-        teacher, _ = load_teacher_checkpoint(
-            checkpoint_path=teacher_ckpt_path,
-            num_classes=num_classes,
-            backbone=args.teacher_backbone,
-            imagenet_pretrained=args.imagenet_pretrained,
-            device=device,
-        )
-        print(f"[Teacher] Loaded existing checkpoint: {teacher_ckpt_path}")
-    except Exception as exc:
+    if str(args.teacher_backbone).strip().lower() != "resnet18":
         warnings.warn(
-            f"Failed to load teacher checkpoint ({teacher_ckpt_path}), retraining. error={exc}",
+            "Paper-aligned soft-label protocol uses a ResNet-18 teacher. "
+            f"Current teacher_backbone={args.teacher_backbone}",
             RuntimeWarning,
         )
+
+    teacher_ckpt_path = teacher_baseline_dir / "teacher_best.pt"
+    if not teacher_ckpt_path.exists():
+        if not bool(args.auto_train_teacher_baseline):
+            raise FileNotFoundError(
+                "Teacher checkpoint not found. Run `bash baseline.sh` first or pass "
+                f"`--auto-train-teacher-baseline`. Missing path: {teacher_ckpt_path}"
+            )
+
+        print(f"[Teacher] Missing checkpoint, training baseline explicitly: {teacher_ckpt_path}")
         teacher, _ = train_teacher_baseline(
             train_set=train_set,
             val_set=val_set,
@@ -729,6 +881,37 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             amp_enabled=amp_enabled,
             baseline_dir=teacher_baseline_dir,
         )
+    else:
+        try:
+            teacher, _ = load_teacher_checkpoint(
+                checkpoint_path=teacher_ckpt_path,
+                num_classes=num_classes,
+                backbone=args.teacher_backbone,
+                imagenet_pretrained=args.imagenet_pretrained,
+                device=device,
+            )
+            print(f"[Teacher] Loaded existing checkpoint: {teacher_ckpt_path}")
+        except Exception as exc:
+            if not bool(args.auto_train_teacher_baseline):
+                raise RuntimeError(
+                    "Failed to load teacher checkpoint. Re-run `bash baseline.sh` or pass "
+                    f"`--auto-train-teacher-baseline`. path={teacher_ckpt_path}"
+                ) from exc
+
+            warnings.warn(
+                f"Failed to load teacher checkpoint ({teacher_ckpt_path}), retraining explicitly. error={exc}",
+                RuntimeWarning,
+            )
+            teacher, _ = train_teacher_baseline(
+                train_set=train_set,
+                val_set=val_set,
+                test_set=test_set,
+                num_classes=num_classes,
+                args=args,
+                device=device,
+                amp_enabled=amp_enabled,
+                baseline_dir=teacher_baseline_dir,
+            )
 
     # Latents are independent of IPC, so cache them under dataset baseline dir.
     latent_cache_path = teacher_baseline_dir / "train_latents.pt"
@@ -783,13 +966,11 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             clusters_per_class=args.clusters_per_class,
             num_classes=num_classes,
             seed=args.seed,
-            gamma_0=args.clvq_gamma0,
-            alpha=args.clvq_alpha,
             max_iter=args.clvq_max_iter,
             tol=args.clvq_tol,
-            check_interval=args.clvq_check_interval,
+            minibatch_size=args.clvq_batch_size,
             medoid_anchor=args.clvq_medoid_anchor,
-            weight_count_power=args.weight_count_power,
+            weighting_strategy=args.weighting_strategy,
         )
 
         class_prompts = dataset_spec.build_class_prompts()
@@ -821,7 +1002,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             clusters_per_class=args.clusters_per_class,
             num_classes=num_classes,
             seed=args.seed,
-            weight_count_power=args.weight_count_power,
+            weighting_strategy=args.weighting_strategy,
         )
         expected_labels = selected.labels.long().cpu()
         stream_iter = iter_images_by_indices(
@@ -840,7 +1021,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             clusters_per_class=args.clusters_per_class,
             num_classes=num_classes,
             seed=args.seed,
-            weight_count_power=args.weight_count_power,
+            weighting_strategy=args.weighting_strategy,
             kmeans_max_iter=args.kmeans_max_iter,
         )
         expected_labels = selected.labels.long().cpu()
@@ -861,6 +1042,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     soft_label_chunks: list[torch.Tensor] = []
     preview_chunks: list[torch.Tensor] = []
     image_chunks: list[torch.Tensor] = []
+    collect_full_images = bool(args.store_images_in_pt or args.fkd_precompute_batches)
     preview_budget = 100
     cursor = 0
     shard_root = output_dir / "distilled_shards"
@@ -919,7 +1101,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
                 preview_chunks.append(image_batch[:keep_n])
                 preview_budget -= keep_n
 
-            if bool(args.store_images_in_pt):
+            if collect_full_images:
                 image_chunks.append(image_batch)
 
             cursor += batch_n
@@ -938,9 +1120,47 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         preview_images = torch.cat(preview_chunks, dim=0)
         save_preview_grid(preview_images, output_dir / "distilled_preview.png")
 
+    distilled_images_full: torch.Tensor | None = None
+    if collect_full_images:
+        distilled_images_full = torch.cat(image_chunks, dim=0)
+
     distilled_images_for_pt: torch.Tensor | None = None
     if bool(args.store_images_in_pt):
-        distilled_images_for_pt = torch.cat(image_chunks, dim=0)
+        distilled_images_for_pt = distilled_images_full
+
+    fkd_batch_path = ""
+    fkd_batch_summary: dict[str, object] | None = None
+    if bool(args.fkd_precompute_batches):
+        if distilled_images_full is None:
+            raise RuntimeError("FKD precomputation requested but distilled images were not retained in memory.")
+
+        fkd_batch_cache = precompute_fkd_batch_cache(
+            teacher=teacher,
+            distilled_images=distilled_images_full,
+            image_size=args.image_size,
+            batch_size=args.fkd_batch_size,
+            train_epochs=args.fkd_train_epochs,
+            crop_min_scale=args.fkd_crop_min_scale,
+            crop_max_scale=args.fkd_crop_max_scale,
+            horizontal_flip_prob=args.fkd_horizontal_flip_prob,
+            soft_label_temperature=args.teacher_temperature,
+            eval_batch_size=args.eval_batch_size,
+            device=device,
+            seed=args.seed,
+        )
+        fkd_batch_path = "fkd_batches.pt"
+        torch.save(fkd_batch_cache, output_dir / fkd_batch_path)
+        fkd_batch_summary = {
+            "batch_size": int(fkd_batch_cache["batch_size"]),
+            "batches_per_epoch": int(fkd_batch_cache["batches_per_epoch"]),
+            "train_epochs": int(fkd_batch_cache["train_epochs"]),
+            "num_batches": int(fkd_batch_cache["num_batches"]),
+            "image_size": int(fkd_batch_cache["image_size"]),
+            "crop_min_scale": float(fkd_batch_cache["crop_min_scale"]),
+            "crop_max_scale": float(fkd_batch_cache["crop_max_scale"]),
+            "horizontal_flip_prob": float(fkd_batch_cache["horizontal_flip_prob"]),
+            "seed": int(fkd_batch_cache["seed"]),
+        }
 
     save_distillation_artifacts(
         output_dir=output_dir,
@@ -952,8 +1172,11 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         saved_paths=saved_paths,
         dataset_name=dataset_spec.name,
         lora_path=resolved_lora_path,
+        teacher_temperature=args.teacher_temperature,
         image_shards=shard_paths,
         store_images_in_pt=bool(args.store_images_in_pt),
+        fkd_batch_path=fkd_batch_path,
+        fkd_batch_summary=fkd_batch_summary,
     )
 
     del vae
@@ -964,15 +1187,22 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "dataset": dataset_spec.name,
         "data_root": args.data_root,
         "teacher_baseline_dir": str(teacher_baseline_dir),
+        "teacher_checkpoint": str(teacher_ckpt_path),
         "num_classes": int(num_classes),
         "distill_method": str(args.distill_method),
+        "clustering_backend": "MiniBatchKMeans" if args.distill_method == "clvq" else str(args.distill_method),
         "clusters_per_class": float(args.clusters_per_class),
         "clvq_medoid_anchor": float(args.clvq_medoid_anchor),
+        "clvq_batch_size": int(args.clvq_batch_size),
+        "clvq_minibatch_size": int(args.clvq_batch_size),
         "kmeans_max_iter": int(args.kmeans_max_iter),
         "num_distilled": int(cursor),
         "teacher_backbone": str(args.teacher_backbone),
         "teacher_temperature": float(args.teacher_temperature),
-        "weight_count_power": float(args.weight_count_power),
+        "weighting_strategy": str(args.weighting_strategy),
+        "fkd_precompute_batches": bool(args.fkd_precompute_batches),
+        "fkd_batch_path": str(fkd_batch_path),
+        "fkd_batch_summary": dict(fkd_batch_summary or {}),
         "lora_path": resolved_lora_path,
         "latent_cache_path": str(latent_cache_path),
         "latent_source": latent_source,
@@ -988,7 +1218,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Dataset distillation: teacher training + VAE encode + class-wise CLVQ/KMeans/Random selection "
+            "Dataset distillation: explicit teacher baseline + VAE encode + "
+            "class-wise CLVQ (implemented via MiniBatchKMeans) / KMeans / Random selection "
             "+ optional reverse-SDE decode"
         )
     )
@@ -999,20 +1230,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--clusters-per-class", type=float, default=100.0)
     parser.add_argument("--distill-method", type=str, default="clvq", choices=["clvq", "random", "kmeans"])
-    parser.add_argument("--clvq-gamma0", type=float, default=0.5)
-    parser.add_argument("--clvq-alpha", type=float, default=0.6)
     parser.add_argument("--clvq-max-iter", type=int, default=10000)
     parser.add_argument("--clvq-tol", type=float, default=1e-5)
-    parser.add_argument("--clvq-check-interval", type=int, default=500)
+    parser.add_argument("--clvq-batch-size", type=int, default=1024)
     parser.add_argument("--clvq-medoid-anchor", type=float, default=0.0)
     parser.add_argument("--kmeans-max-iter", type=int, default=300)
-    parser.add_argument("--weight-count-power", type=float, default=0.5)
+    parser.add_argument(
+        "--weighting-strategy",
+        type=str,
+        default="heuristic",
+        choices=["heuristic", "direct", "uniform"],
+    )
 
     parser.add_argument("--encode-batch-size", type=int, default=64)
     parser.add_argument("--decode-batch-size", type=int, default=32)
     parser.add_argument("--save-batch-size", type=int, default=64)
     parser.add_argument("--save-async-workers", type=int, default=0)
     parser.add_argument("--store-images-in-pt", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--fkd-precompute-batches", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--fkd-train-epochs", type=int, default=300)
+    parser.add_argument("--fkd-batch-size", type=int, default=1024)
+    parser.add_argument("--fkd-crop-min-scale", type=float, default=0.08)
+    parser.add_argument("--fkd-crop-max-scale", type=float, default=1.0)
+    parser.add_argument("--fkd-horizontal-flip-prob", type=float, default=0.5)
 
     parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--diffusion-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
@@ -1022,12 +1262,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sde-steps", type=int, default=200)
     parser.add_argument("--sde-noise-strength", type=float, default=0.2)
 
-    parser.add_argument("--teacher-backbone", type=str, default="resnet50", choices=["resnet18", "resnet50"])
+    parser.add_argument("--teacher-backbone", type=str, default="resnet18", choices=["resnet18", "resnet50"])
     parser.add_argument("--teacher-epochs", type=int, default=20)
-    parser.add_argument("--teacher-batch-size", type=int, default=64)
+    parser.add_argument("--teacher-batch-size", type=int, default=128)
     parser.add_argument("--teacher-lr", type=float, default=3e-4)
     parser.add_argument("--teacher-weight-decay", type=float, default=1e-4)
     parser.add_argument("--teacher-temperature", type=float, default=20.0)
+    parser.add_argument("--auto-train-teacher-baseline", action=argparse.BooleanOptionalAction, default=False)
 
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--image-size", type=int, default=224)

@@ -1,39 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ✅ 新增：安全浮点数比较函数
-float_le() {
-  awk -v a="$1" -v b="$2" 'BEGIN { exit !(a <= b) }'
-}
-
 DATASET="${DATASET:-dermamnist}"
 DATASET="$(echo "$DATASET" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-if [[ "$DATASET" == "odir5k" ]]; then DATASET="odir-5k"
+if [[ "$DATASET" == "odir5k" ]]; then
+  DATASET="odir-5k"
 fi
 if [[ "$DATASET" == "aptos" || "$DATASET" == "aptos2019" || "$DATASET" == "aptos-2019" ]]; then
   DATASET="aptos-2019-blindness-detection"
 fi
 
 DATA_ROOT="${DATA_ROOT:-${HF_DATASETS_CACHE:-${HF_HOME:-data}}}"
-BACKBONE="${BACKBONE:-resnet50}"
+BACKBONE="${BACKBONE:-resnet18}"
 IPC="${IPC:-100}"
 DISTILLED_DIR="${DISTILLED_DIR:-outputs/${DATASET}_224_distill_ipc${IPC}}"
 DISTILLED_DATA="${DISTILLED_DATA:-${DISTILLED_DIR}/distilled_data.pt}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_student_ipc${IPC}}"
 
-if [[ -z "${TRAIN_BATCH_SIZE:-}" ]]; then
-  case "${BACKBONE}" in
-    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224) TRAIN_BATCH_SIZE="32" ;;
-    *) TRAIN_BATCH_SIZE="64" ;;
-  esac
-fi
-
-if [[ -z "${EVAL_BATCH_SIZE:-}" ]]; then
-  case "${BACKBONE}" in
-    vit|vit_tiny|vit-tiny|vit_tiny_patch16_224) EVAL_BATCH_SIZE="64" ;;
-    *) EVAL_BATCH_SIZE="128" ;;
-  esac
-fi
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1024}"
+TRAIN_CROP_MIN_SCALE="${TRAIN_CROP_MIN_SCALE:-0.08}"
+TRAIN_CROP_MAX_SCALE="${TRAIN_CROP_MAX_SCALE:-1.0}"
+TRAIN_HFLIP_PROB="${TRAIN_HFLIP_PROB:-0.5}"
+USE_FKD_BATCHES="${USE_FKD_BATCHES:-true}"
+KD_TEMPERATURE="${KD_TEMPERATURE:-0}"
+TRAIN_LR="${TRAIN_LR:-3e-4}"
 
 if [[ "$DATASET" == "aptos-2019-blindness-detection" ]]; then
   if [[ ! -f "$DATA_ROOT/train.csv" || ! -d "$DATA_ROOT/train_images" ]]; then
@@ -44,42 +36,9 @@ if [[ "$DATASET" == "aptos-2019-blindness-detection" ]]; then
   fi
 fi
 
-# ✅ 修复：KD_TEMPERATURE 判断
-if [[ -z "${KD_TEMPERATURE:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then
-    if float_le "$IPC" 100; then
-      KD_TEMPERATURE="1.5"
-    else
-      KD_TEMPERATURE="2.0"
-    fi
-  else
-    KD_TEMPERATURE="1.0"
-  fi
-fi
-
-if [[ -z "${HARD_LABEL_ALPHA:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then HARD_LABEL_ALPHA="0.35"
-  else HARD_LABEL_ALPHA="0.0"
-  fi
-fi
-
-if [[ -z "${WEIGHT_BALANCE_ALPHA:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then WEIGHT_BALANCE_ALPHA="0.35"
-  else WEIGHT_BALANCE_ALPHA="0.0"
-  fi
-fi
-
-# ✅ 修复：SOFT_LABEL_SHARPEN 判断
-if [[ -z "${SOFT_LABEL_SHARPEN:-}" ]]; then
-  if [[ "$DATASET" == "dermamnist" ]]; then
-    if float_le "$IPC" 100; then
-      SOFT_LABEL_SHARPEN="0.9"
-    else
-      SOFT_LABEL_SHARPEN="0.85"
-    fi
-  else
-    SOFT_LABEL_SHARPEN="1.0"
-  fi
+USE_FKD_FLAG="--use-fkd-batches"
+if [[ "$USE_FKD_BATCHES" == "false" ]]; then
+  USE_FKD_FLAG="--no-use-fkd-batches"
 fi
 
 uv run run-train-distilled-student \
@@ -88,15 +47,19 @@ uv run run-train-distilled-student \
   --distilled-data "$DISTILLED_DATA" \
   --output-dir "$OUTPUT_DIR" \
   --student-backbone "$BACKBONE" \
-  --train-epochs 20 \
+  --train-epochs "$TRAIN_EPOCHS" \
   --train-batch-size "$TRAIN_BATCH_SIZE" \
   --eval-batch-size "$EVAL_BATCH_SIZE" \
-  --train-lr 3e-4 \
+  --train-lr "$TRAIN_LR" \
   --weight-decay 1e-4 \
   --kd-temperature "$KD_TEMPERATURE" \
-  --hard-label-alpha "$HARD_LABEL_ALPHA" \
-  --weight-balance-alpha "$WEIGHT_BALANCE_ALPHA" \
-  --soft-label-sharpen "$SOFT_LABEL_SHARPEN" \
+  --hard-label-alpha 0.0 \
+  --weight-balance-alpha 0.0 \
+  --soft-label-sharpen 1.0 \
+  --train-crop-min-scale "$TRAIN_CROP_MIN_SCALE" \
+  --train-crop-max-scale "$TRAIN_CROP_MAX_SCALE" \
+  --train-horizontal-flip-prob "$TRAIN_HFLIP_PROB" \
+  "$USE_FKD_FLAG" \
   --amp \
   --num-workers 4 \
   "$@"
