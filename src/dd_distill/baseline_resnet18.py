@@ -9,7 +9,9 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+import timm
 from sklearn.metrics import f1_score, roc_auc_score
+from timm.data import resolve_model_data_config
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -17,13 +19,45 @@ from tqdm import tqdm
 from torchvision import transforms
 from torchvision.models import ResNet18_Weights, ResNet50_Weights, resnet18, resnet50
 
-from .datasets import MedMNISTImageDataset, get_dataset_spec, supported_datasets
+from .datasets import TorchDataset, get_dataset_spec, _normalize_dataset_key, supported_datasets
 from .utils import *
 
 
-def build_teacher_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Compose]:
-    mean = (0.485, 0.456, 0.406)
-    std = (0.229, 0.224, 0.225)
+SUPPORTED_BACKBONES = ("resnet18", "resnet50", "vit_tiny_patch16_224")
+BACKBONE_ALIASES = {
+    "resnet18": "resnet18",
+    "resnet50": "resnet50",
+    "vit": "vit_tiny_patch16_224",
+    "vit_tiny": "vit_tiny_patch16_224",
+    "vit-tiny": "vit_tiny_patch16_224",
+    "vit_tiny_patch16_224": "vit_tiny_patch16_224",
+}
+
+
+def normalize_backbone_name(name: str) -> str:
+    key = str(name).strip().lower().replace("-", "_")
+    return BACKBONE_ALIASES.get(key, key)
+
+
+def resolve_backbone_normalization(backbone: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    backbone_name = normalize_backbone_name(backbone)
+    if backbone_name != "vit_tiny_patch16_224":
+        return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+
+    # ViT follows timm model data config (vit_tiny_patch16_224 defaults to mean/std=0.5).
+    vit_probe = timm.create_model(backbone_name, pretrained=False, num_classes=1)
+    try:
+        data_config = resolve_model_data_config(vit_probe)
+    finally:
+        del vit_probe
+
+    mean = tuple(float(v) for v in data_config.get("mean", (0.5, 0.5, 0.5)))
+    std = tuple(float(v) for v in data_config.get("std", (0.5, 0.5, 0.5)))
+    return mean, std
+
+
+def build_teacher_transforms(image_size: int, backbone: str) -> tuple[transforms.Compose, transforms.Compose]:
+    mean, std = resolve_backbone_normalization(backbone)
     train_transform = transforms.Compose(
         [
             transforms.ToPILImage(),
@@ -45,15 +79,18 @@ def build_teacher_transforms(image_size: int) -> tuple[transforms.Compose, trans
 
 
 def build_classifier(num_classes: int, backbone: str, imagenet_pretrained: bool) -> nn.Module:
-    backbone_name = backbone.lower()
+    backbone_name = normalize_backbone_name(backbone)
     if backbone_name == "resnet18":
         weights = ResNet18_Weights.IMAGENET1K_V1 if imagenet_pretrained else None
         model = resnet18(weights=weights)
     elif backbone_name == "resnet50":
         weights = ResNet50_Weights.IMAGENET1K_V2 if imagenet_pretrained else None
         model = resnet50(weights=weights)
+    elif backbone_name == "vit_tiny_patch16_224":
+        # vit_tiny_patch16_224 is selected for 12GB GPUs as a practical ViT baseline.
+        return timm.create_model(backbone_name, pretrained=imagenet_pretrained, num_classes=num_classes)
     else:
-        raise ValueError(f"Unsupported backbone: {backbone}.")
+        raise ValueError(f"Unsupported backbone: {backbone}. choices={SUPPORTED_BACKBONES}")
 
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
@@ -183,9 +220,9 @@ def summarize_teacher_model(
     checkpoint_path: Path,
     best_val_acc: float | None,
 ) -> dict[str, Any]:
-    _, eval_transform = build_teacher_transforms(args.image_size)
+    _, eval_transform = build_teacher_transforms(args.image_size, args.teacher_backbone)
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        MedMNISTImageDataset(test_set, transform=eval_transform),
+        TorchDataset(test_set, transform=eval_transform),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -241,24 +278,24 @@ def train_teacher_baseline(
     if args.teacher_epochs <= 0:
         raise ValueError("teacher_epochs must be positive.")
 
-    train_transform, eval_transform = build_teacher_transforms(args.image_size)
+    train_transform, eval_transform = build_teacher_transforms(args.image_size, args.teacher_backbone)
 
     train_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        MedMNISTImageDataset(train_set, transform=train_transform),
+        TorchDataset(train_set, transform=train_transform),
         batch_size=args.teacher_batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        MedMNISTImageDataset(val_set, transform=eval_transform),
+        TorchDataset(val_set, transform=eval_transform),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-        MedMNISTImageDataset(test_set, transform=eval_transform),
+        TorchDataset(test_set, transform=eval_transform),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -391,7 +428,7 @@ def run_teacher_baseline(args: argparse.Namespace) -> dict[str, Any]:
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
         json.dump(run_config, handle, indent=2)
 
-    split_bundle = dataset_spec.load_distillation_splits(data_root=args.data_root, image_size=args.image_size)
+    split_bundle = dataset_spec.load_dataset_splits(data_root=args.data_root, image_size=args.image_size)
     train_set = split_bundle.train_set
     val_set = split_bundle.val_set
     test_set = split_bundle.test_set
@@ -418,11 +455,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(DermaMNIST, BloodMNIST, NIH Chest X-ray14, ODIR-5K)."
         )
     )
-    parser.add_argument("--dataset", type=str, default="dermamnist", choices=supported_datasets())
+    parser.add_argument("--dataset", type=_normalize_dataset_key, default="dermamnist", choices=supported_datasets())
     parser.add_argument("--data-root", type=str, default=default_data_root())
     parser.add_argument("--output-dir", type=str, default="")
 
-    parser.add_argument("--teacher-backbone", type=str, default="resnet18", choices=["resnet18", "resnet50"])
+    parser.add_argument(
+        "--teacher-backbone",
+        type=normalize_backbone_name,
+        default="resnet18",
+        choices=list(SUPPORTED_BACKBONES),
+    )
     parser.add_argument("--teacher-epochs", type=int, default=20)
     parser.add_argument("--teacher-batch-size", type=int, default=128)
     parser.add_argument("--teacher-lr", type=float, default=3e-4)

@@ -24,13 +24,6 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from .datasets import get_dataset_spec, supported_datasets
 
 
-def normalize_dataset_name(dataset: str) -> str:
-    key = str(dataset).strip().lower().replace("_", "-")
-    if key == "odir5k":
-        return "odir-5k"
-    return key
-
-
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -56,17 +49,6 @@ def build_sample_indices(total_samples: int, max_samples: int, seed: int) -> np.
         return np.arange(total_samples, dtype=np.int64)
     rng = np.random.default_rng(seed)
     return np.asarray(rng.choice(total_samples, size=max_samples, replace=False), dtype=np.int64)
-
-
-def build_dataset_prompts(
-    dataset_spec: Any,
-    data_root: str,
-    image_size: int,
-) -> tuple[dict[int, str], str]:
-    class_names = dataset_spec.class_names(data_root=data_root, image_size=image_size)
-    prompts = dataset_spec.build_class_prompts(class_names)
-    default_prompt = f"{dataset_spec.prompt_prefix} medical class"
-    return prompts, default_prompt
 
 
 def default_data_root() -> Path:
@@ -209,7 +191,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_dir = Path(args.output_dir) if args.output_dir else default_lora_output_dir(dataset_spec.name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_split, class_names = dataset_spec.load_lora_train_split(data_root=str(data_root), image_size=args.resolution)
+    split_bundle = dataset_spec.load_dataset_splits(data_root=str(data_root), image_size=args.resolution)
+    train_split = split_bundle.train_set
     labels_all = np.asarray(
         train_split.get_all_labels() if hasattr(train_split, "get_all_labels") else train_split.labels,
         dtype=np.int64,
@@ -217,12 +200,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     sample_indices = build_sample_indices(len(labels_all), args.max_train_samples, args.seed)
     labels = labels_all[sample_indices]
 
-    data_root_for_labels = str(data_root)
-    class_prompts, default_prompt = build_dataset_prompts(
-        dataset_spec=dataset_spec,
-        data_root=data_root_for_labels,
-        image_size=args.resolution,
-    )
+    class_prompts = dataset_spec.build_class_prompts()
+    default_prompt = next(iter(class_prompts.values()), "medical image")
 
     print(f"[LoRA-Train] dataset={dataset_spec.name} data_root={data_root}")
     label_values, label_counts = np.unique(labels, return_counts=True)
@@ -455,7 +434,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dataset",
-        type=normalize_dataset_name,
         default="dermamnist",
         choices=supported_datasets(),
     )
