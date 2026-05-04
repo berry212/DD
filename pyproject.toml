@@ -47,8 +47,8 @@ packages = ["src/dd_distill"]
 
 [[tool.uv.index]]
 # url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-# url = "https://pypi.org/simple"
-url = "https://pypi.mirrors.ustc.edu.cn/simple"
+url = "https://pypi.org/simple"
+# url = "https://pypi.mirrors.ustc.edu.cn/simple"
 default = true
 
 [tool.uv.sources]
