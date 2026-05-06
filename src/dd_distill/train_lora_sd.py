@@ -5,21 +5,22 @@ import json
 import math
 import os
 import random
+import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from torch import nn
+from diffusers import AutoencoderKL, DDPMScheduler, DiTTransformer2DModel
 from diffusers.training_utils import cast_training_params
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
-from transformers import CLIPTextModel, CLIPTokenizer
 
 from .datasets import get_dataset_spec, supported_datasets
 
@@ -108,23 +109,71 @@ def create_lr_scheduler(
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
+def strip_variance_channels(
+    model_pred: torch.Tensor,
+    target_channels: int,
+    variance_type: str | None,
+) -> torch.Tensor:
+    if model_pred.shape[1] == target_channels:
+        return model_pred
+
+    if model_pred.shape[1] == 2 * target_channels:
+        warnings.warn(
+            "DiT output includes variance channels; dropping variance prediction for loss.",
+            RuntimeWarning,
+        )
+        return model_pred[:, :target_channels]
+
+    raise ValueError(
+        "DiT output channels do not match latent channels: "
+        f"pred={model_pred.shape[1]} target={target_channels} variance_type={variance_type}"
+    )
+
+
+def load_dit_transformer(model_id: str, dtype: torch.dtype) -> DiTTransformer2DModel:
+    try:
+        return DiTTransformer2DModel.from_pretrained(
+            model_id,
+            subfolder="transformer",
+            torch_dtype=dtype,
+        )
+    except Exception:
+        return DiTTransformer2DModel.from_pretrained(model_id, torch_dtype=dtype)
+
+
+def load_vae(model_id: str, dtype: torch.dtype) -> AutoencoderKL:
+    try:
+        return AutoencoderKL.from_pretrained(model_id, torch_dtype=dtype)
+    except Exception:
+        return AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype)
+
+
+def load_scheduler(model_id: str) -> DDPMScheduler:
+    try:
+        return DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+    except Exception:
+        return DDPMScheduler.from_pretrained(model_id)
+
+
+def save_lora_artifacts(output_dir: Path, transformer: nn.Module, lora_config: LoraConfig) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lora_state_dict = get_peft_model_state_dict(transformer)
+    torch.save(lora_state_dict, output_dir / "lora_transformer.pt")
+    with open(output_dir / "lora_config.json", "w", encoding="utf-8") as handle:
+        json.dump(lora_config.to_dict(), handle, indent=2)
+
+
+class MedMNISTClassDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
         split_data: Any,
         sample_indices: np.ndarray,
-        tokenizer: CLIPTokenizer,
         resolution: int,
-        prompt_dropout_prob: float,
-        class_prompts: dict[int, str],
-        default_prompt: str,
+        class_label_offset: int,
     ) -> None:
         self.split_data = split_data
         self.sample_indices = np.ascontiguousarray(sample_indices, dtype=np.int64)
-        self.tokenizer = tokenizer
-        self.prompts = dict(class_prompts)
-        self.default_prompt = default_prompt
-        self.prompt_dropout_prob = float(np.clip(prompt_dropout_prob, 0.0, 1.0))
+        self.class_label_offset = int(class_label_offset)
 
         if hasattr(split_data, "get_all_labels"):
             self.labels = np.asarray(split_data.get_all_labels()).reshape(-1).astype(np.int64, copy=False)
@@ -157,24 +206,12 @@ class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
 
         image = np.asarray(image)
         label = int(label)
-        prompt = self.prompts.get(label, f"{self.default_prompt} class {label}")
-        if self.prompt_dropout_prob > 0.0 and random.random() < self.prompt_dropout_prob:
-            prompt = ""
-
         pixel = self.transform(image)
         pixel = pixel * 2.0 - 1.0
-
-        input_ids = self.tokenizer(
-            prompt,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            padding="max_length",
-            return_tensors="pt",
-        ).input_ids[0]
-
+        class_label = int(label) + self.class_label_offset
         return {
             "pixel_values": pixel,
-            "input_ids": input_ids,
+            "class_labels": torch.tensor(class_label, dtype=torch.long),
         }
 
 
@@ -188,6 +225,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.data_npz:
         print("[LoRA-Train] --data-npz is deprecated and ignored; loading data directly from dataset split.")
 
+    if args.prompt_dropout_prob:
+        warnings.warn("--prompt-dropout-prob is ignored for DiT training.", RuntimeWarning)
+
     output_dir = Path(args.output_dir) if args.output_dir else default_lora_output_dir(dataset_spec.name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -200,9 +240,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     sample_indices = build_sample_indices(len(labels_all), args.max_train_samples, args.seed)
     labels = labels_all[sample_indices]
 
-    class_prompts = dataset_spec.build_class_prompts()
-    default_prompt = next(iter(class_prompts.values()), "medical image")
-
     print(f"[LoRA-Train] dataset={dataset_spec.name} data_root={data_root}")
     label_values, label_counts = np.unique(labels, return_counts=True)
     class_distribution = {int(k): int(v) for k, v in zip(label_values.tolist(), label_counts.tolist())}
@@ -210,43 +247,60 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     weight_dtype = torch.float16 if args.fp16 and device.type == "cuda" else torch.float32
 
-    tokenizer = CLIPTokenizer.from_pretrained(args.base_model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.base_model_id, subfolder="text_encoder", torch_dtype=weight_dtype)
-    vae = AutoencoderKL.from_pretrained(args.base_model_id, subfolder="vae", torch_dtype=weight_dtype)
-    unet = UNet2DConditionModel.from_pretrained(args.base_model_id, subfolder="unet", torch_dtype=weight_dtype)
-    noise_scheduler = DDPMScheduler.from_pretrained(args.base_model_id, subfolder="scheduler")
+    if args.base_model_id and not args.dit_model_id:
+        warnings.warn("--base-model-id is deprecated; use --dit-model-id.", RuntimeWarning)
 
-    text_encoder.to(device)
+    dit_model_id = args.dit_model_id or args.base_model_id
+    vae_model_id = args.vae_model_id or dit_model_id
+    scheduler_model_id = args.scheduler_model_id or dit_model_id
+
+    transformer = load_dit_transformer(dit_model_id, dtype=weight_dtype)
+    vae = load_vae(vae_model_id, dtype=weight_dtype)
+    noise_scheduler = load_scheduler(scheduler_model_id)
+
+    transformer.to(device)
     vae.to(device)
-    unet.to(device)
 
+    transformer.requires_grad_(False)
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    unet.requires_grad_(False)
+
+    target_modules = [v.strip() for v in args.lora_target_modules.split(",") if v.strip()]
+    if not target_modules:
+        raise ValueError("--lora-target-modules must provide at least one module name")
 
     lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.lora_alpha,
         init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        target_modules=target_modules,
     )
-    unet.add_adapter(lora_config)
-    if weight_dtype == torch.float16 and device.type == "cuda":
-        cast_training_params(unet, dtype=torch.float32)
-    unet.train()
+    if hasattr(transformer, "add_adapter"):
+        transformer.add_adapter(lora_config)
+    else:
+        transformer = get_peft_model(transformer, lora_config)
 
-    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    if weight_dtype == torch.float16 and device.type == "cuda":
+        cast_training_params(transformer, dtype=torch.float32)
+    transformer.train()
+
+    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
     trainable_param_count = int(sum(p.numel() for p in trainable_params))
     print(f"[LoRA-Train] trainable_params={trainable_param_count}")
 
-    dataset = MedMNISTTextDataset(
+    num_classes = getattr(transformer.config, "num_classes", None)
+    if num_classes is not None and int(num_classes) > 0:
+        max_label = int(labels.max()) + int(args.class_label_offset) if labels.size > 0 else 0
+        if max_label >= int(num_classes):
+            raise ValueError(
+                f"Dataset labels exceed DiT num_classes (max_label={max_label}, num_classes={num_classes}). "
+                "Use --class-label-offset or a compatible DiT checkpoint."
+            )
+
+    dataset = MedMNISTClassDataset(
         split_data=train_split,
         sample_indices=sample_indices,
-        tokenizer=tokenizer,
         resolution=args.resolution,
-        prompt_dropout_prob=args.prompt_dropout_prob,
-        class_prompts=class_prompts,
-        default_prompt=default_prompt,
+        class_label_offset=args.class_label_offset,
     )
 
     sampler = create_class_balanced_sampler(labels) if args.class_balance else None
@@ -289,12 +343,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for epoch in range(1, args.epochs + 1):
         for batch_idx, batch in enumerate(data_loader, start=1):
             pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
-            input_ids = batch["input_ids"].to(device)
+            class_labels = batch["class_labels"].to(device)
 
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * float(getattr(vae.config, "scaling_factor", 0.18215))
-                encoder_hidden_states = text_encoder(input_ids)[0]
 
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
@@ -320,11 +373,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             noisy_latents = noise_scheduler.add_noise(latents, sampled_noise, timesteps)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(weight_dtype == torch.float16)):
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = transformer(noisy_latents, timesteps, class_labels=class_labels).sample
                 if noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     target = noise
+
+                model_pred = strip_variance_channels(
+                    model_pred,
+                    target_channels=target.shape[1],
+                    variance_type=getattr(noise_scheduler.config, "variance_type", None),
+                )
 
                 if args.snr_gamma > 0.0:
                     snr = compute_snr(noise_scheduler, timesteps)
@@ -375,32 +434,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.save_every_epoch:
             ckpt_dir = output_dir / f"checkpoint-epoch-{epoch:03d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            unet_lora_state_dict = get_peft_model_state_dict(unet)
-            StableDiffusionPipeline.save_lora_weights(
-                save_directory=str(ckpt_dir),
-                unet_lora_layers=unet_lora_state_dict,
-                safe_serialization=True,
-            )
+            save_lora_artifacts(ckpt_dir, transformer, lora_config)
 
         if stop_training:
             break
 
-    unet_lora_state_dict = get_peft_model_state_dict(unet)
-    StableDiffusionPipeline.save_lora_weights(
-        save_directory=str(output_dir),
-        unet_lora_layers=unet_lora_state_dict,
-        safe_serialization=True,
-    )
+    save_lora_artifacts(output_dir, transformer, lora_config)
 
     summary = {
         "dataset": dataset_spec.name,
-        "base_model_id": args.base_model_id,
+        "dit_model_id": str(dit_model_id),
+        "vae_model_id": str(vae_model_id),
+        "scheduler_model_id": str(scheduler_model_id),
         "data_root": str(data_root),
         "data_npz": str(Path(args.data_npz).expanduser()) if args.data_npz else "",
         "train_samples_used": int(len(dataset)),
         "resolution": int(args.resolution),
         "rank": int(args.rank),
         "lora_alpha": int(args.lora_alpha),
+        "lora_target_modules": target_modules,
+        "class_label_offset": int(args.class_label_offset),
         "epochs": int(args.epochs),
         "max_train_steps": int(args.max_train_steps),
         "global_step": int(global_step),
@@ -408,7 +461,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "effective_batch_size": int(args.batch_size * grad_accum_steps),
         "gradient_accumulation_steps": int(grad_accum_steps),
         "class_balance": bool(args.class_balance),
-        "prompt_dropout_prob": float(args.prompt_dropout_prob),
         "lr": float(args.lr),
         "lr_schedule": args.lr_schedule,
         "lr_warmup_steps": int(args.lr_warmup_steps),
@@ -430,7 +482,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="LoRA fine-tune Stable Diffusion on supported ophthalmic/medical datasets"
+        description="LoRA fine-tune DiT on supported ophthalmic/medical datasets"
     )
     parser.add_argument(
         "--dataset",
@@ -440,7 +492,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default=str(default_data_root()))
     parser.add_argument("--data-npz", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")
-    parser.add_argument("--base-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
+    parser.add_argument("--dit-model-id", type=str, default="facebook/DiT-XL-2-256")
+    parser.add_argument("--vae-model-id", type=str, default="")
+    parser.add_argument("--scheduler-model-id", type=str, default="")
+    parser.add_argument(
+        "--base-model-id",
+        type=str,
+        default="",
+        help="Deprecated alias for --dit-model-id.",
+    )
 
     parser.add_argument("--resolution", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -448,6 +508,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-steps", type=int, default=3000)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument(
+        "--lora-target-modules",
+        type=str,
+        default="to_k,to_q,to_v,to_out.0",
+        help="Comma-separated DiT module names for LoRA injection.",
+    )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--lr-schedule", type=str, choices=["constant", "cosine"], default="cosine")
     parser.add_argument("--lr-warmup-steps", type=int, default=100)
@@ -457,7 +523,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--snr-gamma", type=float, default=5.0)
     parser.add_argument("--noise-offset", type=float, default=0.05)
     parser.add_argument("--input-perturbation", type=float, default=0.0)
-    parser.add_argument("--prompt-dropout-prob", type=float, default=0.1)
+    parser.add_argument(
+        "--prompt-dropout-prob",
+        type=float,
+        default=0.0,
+        help="Deprecated; ignored for DiT training.",
+    )
     parser.add_argument("--class-balance", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--num-workers", type=int, default=4)
@@ -466,6 +537,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-steps", type=int, default=20)
 
     parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--class-label-offset", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     return parser

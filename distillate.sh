@@ -25,6 +25,9 @@ SDE_STEPS="${SDE_STEPS:-200}"
 SDE_NOISE_STRENGTH="${SDE_NOISE_STRENGTH:-0.2}"
 CLVQ_MEDOID_ANCHOR="${CLVQ_MEDOID_ANCHOR:-0.0}"
 WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-heuristic}"
+DIT_MODEL_ID="${DIT_MODEL_ID:-facebook/DiT-XL-2-256}"
+VAE_MODEL_ID="${VAE_MODEL_ID:-stabilityai/sd-vae-ft-mse}"
+IMAGE_SIZE="${IMAGE_SIZE:-224}"
 
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
@@ -88,11 +91,12 @@ uv run run-distillation \
   --data-root "$DATA_ROOT" \
   --output-dir "$OUTPUT_DIR" \
   --teacher-baseline-dir "$BASELINE_DIR" \
-  --vae-model-id stabilityai/sd-vae-ft-mse \
-  --diffusion-model-id runwayml/stable-diffusion-v1-5 \
+  --vae-model-id "$VAE_MODEL_ID" \
+  --diffusion-model-id "$DIT_MODEL_ID" \
   --lora-path "$LORA_PATH" \
   --lora-scale 0.9 \
   --guidance-scale "$GUIDANCE_SCALE" \
+  --image-size "$IMAGE_SIZE" \
   --clusters-per-class "$IPC" \
   --distill-method "$DISTILL_METHOD" \
   --kmeans-max-iter "$KMEANS_MAX_ITER" \
