@@ -93,7 +93,10 @@ def build_encode_loader(
 
 def load_vae(model_id: str, device: torch.device, dtype: torch.dtype) -> tuple[AutoencoderKL, float]:
     print(f"[Encoding] loading AutoencoderKL: {model_id}")
-    vae = AutoencoderKL.from_pretrained(model_id, torch_dtype=dtype)
+    try:
+        vae = AutoencoderKL.from_pretrained(model_id, torch_dtype=dtype)
+    except Exception:
+        vae = AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype)
     vae.to(device)
     vae.eval()
     vae.requires_grad_(False)
@@ -689,7 +692,6 @@ class ReverseSDEDecoder:
         noise_strength: float,
         lora_path: str,
         lora_scale: float,
-        class_prompts: dict[int, str],
         guidance_scale: float,
         backbone_type: str = "auto",
     ) -> None:
@@ -697,7 +699,6 @@ class ReverseSDEDecoder:
         self.dtype = dtype
         self.num_inference_steps = max(2, int(num_inference_steps))
         self.noise_strength = float(np.clip(noise_strength, 0.01, 1.0))
-        self.class_prompts = dict(class_prompts)
         self.guidance_scale = float(max(0.0, guidance_scale))
         self._default_prompt = next(iter(self.class_prompts.values()), "medical image")
         self.backbone_type = _resolve_backbone_type(model_id, backbone_type)
@@ -722,10 +723,9 @@ class ReverseSDEDecoder:
             "requires_safety_checker": False,
         }
         try:
-            self.pipe = StableDiffusionPipeline.from_pretrained(model_id, **kwargs)
-        except TypeError:
-            kwargs.pop("requires_safety_checker", None)
-            self.pipe = StableDiffusionPipeline.from_pretrained(model_id, **kwargs)
+            self.scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
+        except Exception:
+            self.scheduler = DDIMScheduler.from_pretrained(model_id)
 
         self.pipe.to(self.device)
         self.pipe.set_progress_bar_config(disable=True)
@@ -768,8 +768,44 @@ class ReverseSDEDecoder:
         if not lora_path:
             return
         adapter_dir = Path(lora_path)
-        if not adapter_dir.exists():
-            warnings.warn(f"LoRA path does not exist: {adapter_dir}. Continue without LoRA.", RuntimeWarning)
+        config_path = adapter_dir / "lora_config.json"
+        weight_path = adapter_dir / "lora_transformer.pt"
+        if not adapter_dir.exists() or not config_path.exists() or not weight_path.exists():
+            warnings.warn(
+                f"LoRA artifacts not found under {adapter_dir}; expected lora_config.json and lora_transformer.pt.",
+                RuntimeWarning,
+            )
+            return transformer
+
+        with open(config_path, "r", encoding="utf-8") as handle:
+            raw_config = json.load(handle)
+        allowed_keys = {
+            "r",
+            "lora_alpha",
+            "lora_dropout",
+            "target_modules",
+            "bias",
+            "task_type",
+            "init_lora_weights",
+        }
+        config_payload = {k: raw_config[k] for k in allowed_keys if k in raw_config}
+        lora_config = LoraConfig(**config_payload)
+
+        if hasattr(transformer, "add_adapter"):
+            transformer.add_adapter(lora_config)
+        else:
+            transformer = get_peft_model(transformer, lora_config)
+
+        state_dict = torch.load(weight_path, map_location="cpu")
+        set_peft_model_state_dict(transformer, state_dict)
+        self._apply_lora_scale(transformer, lora_scale)
+        print(f"[LoRA] Loaded DiT adapter from {adapter_dir} with scale={lora_scale}")
+        return transformer
+
+    @staticmethod
+    def _apply_lora_scale(model: nn.Module, lora_scale: float) -> None:
+        scale = float(lora_scale)
+        if scale == 1.0:
             return
         loaded = False
         try:
@@ -947,27 +983,41 @@ class ReverseSDEDecoder:
         start_timestep = timesteps[start_idx]
 
         latents = centers.to(device=self.device, dtype=self.dtype)
+        labels = labels.to(device=self.device, dtype=torch.long)
         noise = torch.randn_like(latents)
         latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
-
-        cond_prompt_embeds = self._prompt_embeddings_for_labels(labels)
-        uncond_prompt_embeds = self._null_prompt_embeddings(latents.size(0)) if self.guidance_scale > 1.0 else None
 
         for timestep in timesteps[start_idx:]:
             model_input = self.scheduler.scale_model_input(latents, timestep)
 
-            if uncond_prompt_embeds is not None:
+            if self.guidance_scale > 1.0 and self.null_class_label is not None:
                 model_input = torch.cat([model_input, model_input], dim=0)
-                prompt_embeds = torch.cat([uncond_prompt_embeds, cond_prompt_embeds], dim=0)
-                noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=prompt_embeds).sample
+                null_labels = torch.full_like(labels, fill_value=int(self.null_class_label))
+                class_labels = torch.cat([null_labels, labels], dim=0)
+                noise_pred = self.transformer(
+                    model_input,
+                    timestep,
+                    class_labels=class_labels,
+                ).sample
                 noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
-                noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=cond_prompt_embeds).sample
+                if self.guidance_scale > 1.0 and self.null_class_label is None and not self._warned_guidance:
+                    warnings.warn(
+                        "Guidance scale > 1 requested but DiT model does not expose a null class label; "
+                        "running without classifier-free guidance.",
+                        RuntimeWarning,
+                    )
+                    self._warned_guidance = True
+                noise_pred = self.transformer(
+                    model_input,
+                    timestep,
+                    class_labels=labels,
+                ).sample
 
             latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
 
-        images = self.pipe.vae.decode(latents / self.scaling_factor).sample
+        images = self.vae.decode(latents / self.scaling_factor).sample
         return (images / 2.0 + 0.5).clamp(0.0, 1.0)
 
     @torch.no_grad()
@@ -1058,7 +1108,7 @@ class ReverseSDEDecoder:
             yield imgs.float().cpu(), labels[start:end].long().cpu()
 
     def cleanup(self) -> None:
-        del self.pipe
+        del self.transformer
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -1086,10 +1136,12 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     teacher_baseline_dir.mkdir(parents=True, exist_ok=True)
 
+    resolved_vae_model_id = str(args.vae_model_id).strip() or str(args.diffusion_model_id)
     run_config = vars(args).copy()
     run_config["output_dir"] = str(output_dir)
     run_config["teacher_baseline_dir"] = str(teacher_baseline_dir)
     run_config["lora_path"] = resolved_lora_path
+    run_config["resolved_vae_model_id"] = resolved_vae_model_id
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
         json.dump(run_config, handle, indent=2)
 
@@ -1164,7 +1216,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     # Latents are independent of IPC, so cache them under dataset baseline dir.
     latent_cache_path = teacher_baseline_dir / "train_latents.pt"
     vae_dtype = torch.float16 if amp_enabled else torch.float32
-    vae, scaling_factor = load_vae(args.vae_model_id, device=device, dtype=vae_dtype)
+    vae_model_id = resolved_vae_model_id
+    vae, scaling_factor = load_vae(vae_model_id, device=device, dtype=vae_dtype)
 
     cached_latents = load_latent_cache(
         cache_path=latent_cache_path,
@@ -1205,7 +1258,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     stream_batch_size = max(1, int(args.save_batch_size))
 
-    decoder: ReverseSDEDecoder | None = None
+    decoder: DiTDecoder | None = None
 
     if args.distill_method == "clvq":
         clvq = classwise_clvq(
@@ -1221,8 +1274,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             weighting_strategy=args.weighting_strategy,
         )
 
-        class_prompts = dataset_spec.build_class_prompts()
-        decoder = ReverseSDEDecoder(
+        decoder = DiTDecoder(
             model_id=args.diffusion_model_id,
             vae=vae,
             device=device,
@@ -1231,7 +1283,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             noise_strength=args.sde_noise_strength,
             lora_path=resolved_lora_path,
             lora_scale=args.lora_scale,
-            class_prompts=class_prompts,
             guidance_scale=args.guidance_scale,
             backbone_type=args.backbone_type,
         )
@@ -1435,6 +1486,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "dataset": dataset_spec.name,
         "data_root": args.data_root,
+        "diffusion_model_id": str(args.diffusion_model_id),
+        "vae_model_id": str(vae_model_id),
         "teacher_baseline_dir": str(teacher_baseline_dir),
         "teacher_checkpoint": str(teacher_ckpt_path),
         "num_classes": int(num_classes),
@@ -1469,7 +1522,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "Dataset distillation: explicit teacher baseline + VAE encode + "
             "class-wise CLVQ (implemented via MiniBatchKMeans) / KMeans / Random selection "
-            "+ optional reverse-SDE decode"
+            "+ optional DiT reverse-SDE decode"
         )
     )
     parser.add_argument("--dataset", default="dermamnist", choices=supported_datasets())

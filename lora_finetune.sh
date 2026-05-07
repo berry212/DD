@@ -12,6 +12,9 @@ fi
 
 DATA_ROOT="${DATA_ROOT:-${HF_DATASETS_CACHE:-${HF_HOME:-data}}}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/lora_${DATASET}}"
+DIT_MODEL_ID="${DIT_MODEL_ID:-facebook/DiT-XL-2-256}"
+VAE_MODEL_ID="${VAE_MODEL_ID:-}"
+RESOLUTION="${RESOLUTION:-224}"
 
 if [[ "$DATASET" == "odir-5k" ]]; then
   if [[ ! -d "$DATA_ROOT/ODIR-5K" ]]; then
@@ -50,7 +53,6 @@ uv run run-train-lora-sd \
   --lr-schedule cosine \
   --lr-warmup-steps 100 \
   --class-balance \
-  --prompt-dropout-prob 0.1 \
   --snr-gamma 5.0 \
   --noise-offset 0.05 \
   --max-grad-norm 1.0 \

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -115,23 +116,71 @@ def create_lr_scheduler(
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
+def strip_variance_channels(
+    model_pred: torch.Tensor,
+    target_channels: int,
+    variance_type: str | None,
+) -> torch.Tensor:
+    if model_pred.shape[1] == target_channels:
+        return model_pred
+
+    if model_pred.shape[1] == 2 * target_channels:
+        warnings.warn(
+            "DiT output includes variance channels; dropping variance prediction for loss.",
+            RuntimeWarning,
+        )
+        return model_pred[:, :target_channels]
+
+    raise ValueError(
+        "DiT output channels do not match latent channels: "
+        f"pred={model_pred.shape[1]} target={target_channels} variance_type={variance_type}"
+    )
+
+
+def load_dit_transformer(model_id: str, dtype: torch.dtype) -> DiTTransformer2DModel:
+    try:
+        return DiTTransformer2DModel.from_pretrained(
+            model_id,
+            subfolder="transformer",
+            torch_dtype=dtype,
+        )
+    except Exception:
+        return DiTTransformer2DModel.from_pretrained(model_id, torch_dtype=dtype)
+
+
+def load_vae(model_id: str, dtype: torch.dtype) -> AutoencoderKL:
+    try:
+        return AutoencoderKL.from_pretrained(model_id, torch_dtype=dtype)
+    except Exception:
+        return AutoencoderKL.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype)
+
+
+def load_scheduler(model_id: str) -> DDPMScheduler:
+    try:
+        return DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+    except Exception:
+        return DDPMScheduler.from_pretrained(model_id)
+
+
+def save_lora_artifacts(output_dir: Path, transformer: nn.Module, lora_config: LoraConfig) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lora_state_dict = get_peft_model_state_dict(transformer)
+    torch.save(lora_state_dict, output_dir / "lora_transformer.pt")
+    with open(output_dir / "lora_config.json", "w", encoding="utf-8") as handle:
+        json.dump(lora_config.to_dict(), handle, indent=2)
+
+
+class MedMNISTClassDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
         split_data: Any,
         sample_indices: np.ndarray,
-        tokenizer: CLIPTokenizer,
         resolution: int,
-        prompt_dropout_prob: float,
-        class_prompts: dict[int, str],
-        default_prompt: str,
+        class_label_offset: int,
     ) -> None:
         self.split_data = split_data
         self.sample_indices = np.ascontiguousarray(sample_indices, dtype=np.int64)
-        self.tokenizer = tokenizer
-        self.prompts = dict(class_prompts)
-        self.default_prompt = default_prompt
-        self.prompt_dropout_prob = float(np.clip(prompt_dropout_prob, 0.0, 1.0))
+        self.class_label_offset = int(class_label_offset)
 
         if hasattr(split_data, "get_all_labels"):
             self.labels = np.asarray(split_data.get_all_labels()).reshape(-1).astype(np.int64, copy=False)
@@ -164,24 +213,12 @@ class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
 
         image = np.asarray(image)
         label = int(label)
-        prompt = self.prompts.get(label, f"{self.default_prompt} class {label}")
-        if self.prompt_dropout_prob > 0.0 and random.random() < self.prompt_dropout_prob:
-            prompt = ""
-
         pixel = self.transform(image)
         pixel = pixel * 2.0 - 1.0
-
-        input_ids = self.tokenizer(
-            prompt,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            padding="max_length",
-            return_tensors="pt",
-        ).input_ids[0]
-
+        class_label = int(label) + self.class_label_offset
         return {
             "pixel_values": pixel,
-            "input_ids": input_ids,
+            "class_labels": torch.tensor(class_label, dtype=torch.long),
         }
 
 
@@ -309,6 +346,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.data_npz:
         print("[LoRA-Train] --data-npz is deprecated and ignored; loading data directly from dataset split.")
 
+    if args.prompt_dropout_prob:
+        warnings.warn("--prompt-dropout-prob is ignored for DiT training.", RuntimeWarning)
+
     output_dir = Path(args.output_dir) if args.output_dir else default_lora_output_dir(dataset_spec.name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -320,9 +360,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     ).reshape(-1)
     sample_indices = build_sample_indices(len(labels_all), args.max_train_samples, args.seed)
     labels = labels_all[sample_indices]
-
-    class_prompts = dataset_spec.build_class_prompts()
-    default_prompt = next(iter(class_prompts.values()), "medical image")
 
     print(f"[LoRA-Train] dataset={dataset_spec.name} data_root={data_root}")
     label_values, label_counts = np.unique(labels, return_counts=True)
@@ -563,6 +600,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     target = noise
 
+                model_pred = strip_variance_channels(
+                    model_pred,
+                    target_channels=target.shape[1],
+                    variance_type=getattr(noise_scheduler.config, "variance_type", None),
+                )
+
                 if args.snr_gamma > 0.0:
                     snr = compute_snr(noise_scheduler, timesteps)
                     if noise_scheduler.config.prediction_type == "v_prediction":
@@ -645,6 +688,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "resolution": int(args.resolution),
         "rank": int(args.rank),
         "lora_alpha": int(args.lora_alpha),
+        "lora_target_modules": target_modules,
+        "class_label_offset": int(args.class_label_offset),
         "epochs": int(args.epochs),
         "max_train_steps": int(args.max_train_steps),
         "global_step": int(global_step),
@@ -652,7 +697,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "effective_batch_size": int(args.batch_size * grad_accum_steps),
         "gradient_accumulation_steps": int(grad_accum_steps),
         "class_balance": bool(args.class_balance),
-        "prompt_dropout_prob": float(args.prompt_dropout_prob),
         "lr": float(args.lr),
         "lr_schedule": args.lr_schedule,
         "lr_warmup_steps": int(args.lr_warmup_steps),
@@ -674,7 +718,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="LoRA fine-tune Stable Diffusion on supported ophthalmic/medical datasets"
+        description="LoRA fine-tune DiT on supported ophthalmic/medical datasets"
     )
     parser.add_argument(
         "--dataset",
@@ -696,6 +740,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-steps", type=int, default=3000)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument(
+        "--lora-target-modules",
+        type=str,
+        default="to_k,to_q,to_v,to_out.0",
+        help="Comma-separated DiT module names for LoRA injection.",
+    )
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--lr-schedule", type=str, choices=["constant", "cosine"], default="cosine")
     parser.add_argument("--lr-warmup-steps", type=int, default=100)
@@ -705,7 +755,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--snr-gamma", type=float, default=5.0)
     parser.add_argument("--noise-offset", type=float, default=0.05)
     parser.add_argument("--input-perturbation", type=float, default=0.0)
-    parser.add_argument("--prompt-dropout-prob", type=float, default=0.1)
+    parser.add_argument(
+        "--prompt-dropout-prob",
+        type=float,
+        default=0.0,
+        help="Deprecated; ignored for DiT training.",
+    )
     parser.add_argument("--class-balance", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--num-workers", type=int, default=4)
@@ -714,6 +769,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-steps", type=int, default=20)
 
     parser.add_argument("--max-train-samples", type=int, default=0)
+    parser.add_argument("--class-label-offset", type=int, default=0)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     return parser
