@@ -1258,7 +1258,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     stream_batch_size = max(1, int(args.save_batch_size))
 
-    decoder: DiTDecoder | None = None
+    decoder: ReverseSDEDecoder | None = None
 
     if args.distill_method == "clvq":
         clvq = classwise_clvq(
@@ -1274,7 +1274,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             weighting_strategy=args.weighting_strategy,
         )
 
-        decoder = DiTDecoder(
+        decoder = ReverseSDEDecoder(
             model_id=args.diffusion_model_id,
             vae=vae,
             device=device,
