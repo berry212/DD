@@ -85,6 +85,8 @@ if [[ ! -f "${BASELINE_DIR}/teacher_best.pt" ]]; then
     OUTPUT_DIR="$BASELINE_DIR" \
     TEACHER_BACKBONE="$TEACHER_BACKBONE" \
     TEACHER_EPOCHS="$TEACHER_EPOCHS" \
+    TEACHER_BATCH_SIZE="${TEACHER_BATCH_SIZE:-64}" \
+    EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}" \
     bash baseline.sh
   else
     echo "[ERROR] Missing teacher checkpoint: ${BASELINE_DIR}/teacher_best.pt"

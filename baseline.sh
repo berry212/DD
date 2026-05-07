@@ -18,10 +18,10 @@ TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 if [[ -z "${TEACHER_BATCH_SIZE:-}" ]]; then
     case "${TEACHER_BACKBONE}" in
         vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
-            TEACHER_BATCH_SIZE="64"
+            TEACHER_BATCH_SIZE="32"
             ;;
         *)
-            TEACHER_BATCH_SIZE="128"
+            TEACHER_BATCH_SIZE="64"
             ;;
     esac
 fi
@@ -29,10 +29,10 @@ fi
 if [[ -z "${EVAL_BATCH_SIZE:-}" ]]; then
     case "${TEACHER_BACKBONE}" in
         vit|vit_tiny|vit-tiny|vit_tiny_patch16_224)
-            EVAL_BATCH_SIZE="64"
+            EVAL_BATCH_SIZE="32"
             ;;
         *)
-            EVAL_BATCH_SIZE="128"
+            EVAL_BATCH_SIZE="64"
             ;;
     esac
 fi
