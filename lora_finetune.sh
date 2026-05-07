@@ -40,9 +40,9 @@ uv run run-train-lora-sd \
   --dataset "$DATASET" \
   --data-root "$DATA_ROOT" \
   --output-dir "$OUTPUT_DIR" \
-  --dit-model-id "$DIT_MODEL_ID" \
-  --vae-model-id "$VAE_MODEL_ID" \
-  --resolution "$RESOLUTION" \
+  --diffusion-model-id runwayml/stable-diffusion-v1-5 \
+  --backbone-type unet \
+  --resolution 224 \
   --batch-size 4 \
   --gradient-accumulation-steps 2 \
   --epochs 20 \

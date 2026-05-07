@@ -125,6 +125,22 @@ class MedMNIST(BaseDataset, ABC):
     # self.attr
     split_class: type[Any]
 
+    @classmethod
+    def _clamp_image_size(cls, image_size: int) -> int:
+        """Clamp to the nearest supported MedMNIST size (max 224)."""
+        available = sorted(getattr(cls.split_class, "available_sizes", [28, 64, 128, 224]))
+        if image_size in available:
+            return image_size
+        # Use the largest available size ≤ requested, or the smallest available.
+        valid = [s for s in available if s <= image_size]
+        clamped = max(valid) if valid else max(available)
+        if clamped != image_size:
+            print(
+                f"[MedMNIST] image_size={image_size} not in {available}; "
+                f"loading at {clamped} (transform will resize to {image_size})"
+            )
+        return clamped
+
     @override
     def class_names(self) -> dict[int, str]:
         #  INFO[dataset_name]['label'] 形如 {"0": "melanocytic nevi", "1": "melanoma", ...}
@@ -134,9 +150,10 @@ class MedMNIST(BaseDataset, ABC):
 
     @override
     def load_dataset_splits(self, data_root: str, image_size: int) -> DatasetSplit:
-        train_set = self.split_class(split="train", download=True, root=data_root, size=image_size)
-        val_set = self.split_class(split="val", download=True, root=data_root, size=image_size)
-        test_set = self.split_class(split="test", download=True, root=data_root, size=image_size)
+        load_size = self._clamp_image_size(image_size)
+        train_set = self.split_class(split="train", download=True, root=data_root, size=load_size)
+        val_set = self.split_class(split="val", download=True, root=data_root, size=load_size)
+        test_set = self.split_class(split="test", download=True, root=data_root, size=load_size)
         class_names = self.class_names()
         return DatasetSplit(
             train_set=train_set,

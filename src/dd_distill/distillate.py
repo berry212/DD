@@ -10,9 +10,15 @@ from typing import Any, Iterator
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, DDIMScheduler, DiTTransformer2DModel
-from peft import LoraConfig, get_peft_model
-from peft.utils import set_peft_model_state_dict
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    PixArtAlphaPipeline,
+    StableDiffusionPipeline,
+    Transformer2DModel,
+)
+from transformers import T5EncoderModel, T5Tokenizer
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from torch import nn
 from torch.utils.data import DataLoader
@@ -666,7 +672,16 @@ def classwise_clvq(
     )
 
 
-class DiTDecoder:
+def _resolve_backbone_type(model_id: str, backbone_type: str) -> str:
+    if backbone_type and backbone_type != "auto":
+        return backbone_type
+    model_lower = model_id.lower()
+    if any(kw in model_lower for kw in ("pixart", "dit", "transformer", "sd3", "flux")):
+        return "dit"
+    return "unet"
+
+
+class ReverseSDEDecoder:
     def __init__(
         self,
         model_id: str,
@@ -678,62 +693,80 @@ class DiTDecoder:
         lora_path: str,
         lora_scale: float,
         guidance_scale: float,
+        backbone_type: str = "auto",
     ) -> None:
         self.device = device
         self.dtype = dtype
         self.num_inference_steps = max(2, int(num_inference_steps))
         self.noise_strength = float(np.clip(noise_strength, 0.01, 1.0))
         self.guidance_scale = float(max(0.0, guidance_scale))
+        self._default_prompt = next(iter(self.class_prompts.values()), "medical image")
+        self.backbone_type = _resolve_backbone_type(model_id, backbone_type)
+        self.scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215))
+        self._prompt_cache: dict[str, torch.Tensor] = {}
 
-        self.transformer = DiTTransformer2DModel.from_pretrained(
-            model_id,
-            subfolder="transformer",
-            torch_dtype=dtype,
-        )
-        self.transformer.to(device)
-        self.transformer.eval()
-        self.transformer.requires_grad_(False)
+        print(f"[Decoder] backbone_type={self.backbone_type} model_id={model_id}")
 
-        self.vae = vae
-        self.vae.to(device)
-        self.vae.eval()
-        self.vae.requires_grad_(False)
+        if self.backbone_type == "dit":
+            self._init_dit_pipeline(model_id=model_id, vae=vae, lora_path=lora_path, lora_scale=lora_scale)
+        else:
+            self._init_unet_pipeline(model_id=model_id, vae=vae, lora_path=lora_path, lora_scale=lora_scale)
 
+    # ---------------------------------------------------------------- #
+    #  UNet (Stable Diffusion) path
+    # ---------------------------------------------------------------- #
+    def _init_unet_pipeline(self, model_id: str, vae: AutoencoderKL, lora_path: str, lora_scale: float) -> None:
+        kwargs: dict[str, Any] = {
+            "torch_dtype": self.dtype,
+            "vae": vae,
+            "safety_checker": None,
+            "requires_safety_checker": False,
+        }
         try:
             self.scheduler = DDIMScheduler.from_pretrained(model_id, subfolder="scheduler")
         except Exception:
             self.scheduler = DDIMScheduler.from_pretrained(model_id)
 
-        self.transformer = self._load_lora_if_provided(
-            transformer=self.transformer,
-            lora_path=lora_path,
-            lora_scale=lora_scale,
-        )
+        self.pipe.to(self.device)
+        self.pipe.set_progress_bar_config(disable=True)
+        self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        self._load_lora_unet(lora_path=lora_path, lora_scale=lora_scale)
 
-        self.scaling_factor = float(getattr(self.vae.config, "scaling_factor", 0.18215))
-        self.null_class_label = self._resolve_null_class_label()
-        self._warned_guidance = False
+    # ---------------------------------------------------------------- #
+    #  DiT (PixArt-α) path
+    # ---------------------------------------------------------------- #
+    def _init_dit_pipeline(self, model_id: str, vae: AutoencoderKL, lora_path: str, lora_scale: float) -> None:
+        kwargs: dict[str, Any] = {
+            "torch_dtype": self.dtype,
+            "vae": vae,
+            "safety_checker": None,
+        }
+        self.pipe = PixArtAlphaPipeline.from_pretrained(model_id, **kwargs)
+        self.pipe.to(self.device)
+        self.pipe.set_progress_bar_config(disable=True)
 
-    def _resolve_null_class_label(self) -> int | None:
-        embedding = getattr(self.transformer, "class_embedding", None)
-        if embedding is None:
-            embedding = getattr(self.transformer, "class_embed", None)
-        if embedding is None or not hasattr(embedding, "num_embeddings"):
-            return None
-        num_embeddings = int(embedding.num_embeddings)
-        if num_embeddings <= 0:
-            return None
-        return num_embeddings - 1
+        # PixArt-α uses DPMSolver by default but DDIM works for reverse-SDE
+        from diffusers import DDIMScheduler
+        try:
+            self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+        except Exception:
+            self.scheduler = DDIMScheduler(
+                num_train_timesteps=self.pipe.scheduler.config.num_train_timesteps,
+                beta_start=self.pipe.scheduler.config.beta_start if hasattr(self.pipe.scheduler.config, "beta_start") else 0.00085,
+                beta_end=self.pipe.scheduler.config.beta_end if hasattr(self.pipe.scheduler.config, "beta_end") else 0.012,
+                beta_schedule="scaled_linear",
+                prediction_type="epsilon",
+            )
 
-    def _load_lora_if_provided(
-        self,
-        transformer: nn.Module,
-        lora_path: str,
-        lora_scale: float,
-    ) -> nn.Module:
+        if lora_path:
+            self._load_lora_dit(lora_path=lora_path, lora_scale=lora_scale)
+
+    # ---------------------------------------------------------------- #
+    #  LoRA helpers
+    # ---------------------------------------------------------------- #
+    def _load_lora_unet(self, lora_path: str, lora_scale: float) -> None:
         if not lora_path:
-            return transformer
-
+            return
         adapter_dir = Path(lora_path)
         config_path = adapter_dir / "lora_config.json"
         weight_path = adapter_dir / "lora_transformer.pt"
@@ -774,16 +807,174 @@ class DiTDecoder:
         scale = float(lora_scale)
         if scale == 1.0:
             return
-        for module in model.modules():
-            if hasattr(module, "scaling"):
-                scaling = getattr(module, "scaling")
-                if isinstance(scaling, torch.Tensor):
-                    module.scaling = scaling * scale
-                else:
-                    module.scaling = float(scaling) * scale
+        loaded = False
+        try:
+            self.pipe.load_lora_weights(str(adapter_dir))
+            loaded = True
+        except Exception:
+            try:
+                self.pipe.unet.load_attn_procs(str(adapter_dir))
+                loaded = True
+            except Exception:
+                warnings.warn("Failed to load LoRA, continue without LoRA.", RuntimeWarning)
+        if loaded:
+            try:
+                self.pipe.fuse_lora(lora_scale=float(lora_scale))
+            except Exception:
+                pass
+            print(f"[LoRA] Loaded UNet adapter from {adapter_dir} with scale={lora_scale}")
+
+    def _load_lora_dit(self, lora_path: str, lora_scale: float) -> None:
+        if not lora_path:
+            return
+        adapter_dir = Path(lora_path)
+        if not adapter_dir.exists():
+            warnings.warn(f"LoRA path does not exist: {adapter_dir}. Continue without LoRA.", RuntimeWarning)
+            return
+        try:
+            from peft import LoraConfig, get_peft_model
+            from peft.utils import set_peft_model_state_dict
+            from safetensors.torch import load_file
+            import json as _json
+
+            lora_weights_path = adapter_dir / "pytorch_lora_weights.safetensors"
+            lora_config_path = adapter_dir / "lora_config.json"
+            if lora_weights_path.exists() and lora_config_path.exists():
+                with open(lora_config_path, "r", encoding="utf-8") as f:
+                    config_dict = _json.load(f)
+                lora_config = LoraConfig(**config_dict)
+                self.pipe.transformer = get_peft_model(self.pipe.transformer, lora_config)
+                state_dict = load_file(str(lora_weights_path))
+                set_peft_model_state_dict(self.pipe.transformer, state_dict)
+                try:
+                    self.pipe.transformer.merge_adapter()
+                except Exception:
+                    pass
+                print(f"[LoRA] Loaded DiT adapter from {adapter_dir} with scale={lora_scale}")
+            else:
+                warnings.warn(f"DiT LoRA weights not found in {adapter_dir}", RuntimeWarning)
+        except Exception as exc:
+            warnings.warn(f"Failed to load DiT LoRA: {exc}", RuntimeWarning)
+
+    # ---------------------------------------------------------------- #
+    #  Prompt encoding — UNet (CLIP) vs DiT (T5)
+    # ---------------------------------------------------------------- #
+    @torch.no_grad()
+    def _encode_prompt(self, prompt: str) -> torch.Tensor:
+        if prompt in self._prompt_cache:
+            return self._prompt_cache[prompt]
+
+        if self.pipe.tokenizer is None or self.pipe.text_encoder is None:
+            raise RuntimeError("Diffusion model must provide tokenizer and text encoder.")
+
+        text_inputs = self.pipe.tokenizer(
+            [prompt],
+            padding="max_length",
+            max_length=self.pipe.tokenizer.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        )
+        input_ids = text_inputs.input_ids.to(self.device)
+        prompt_embeds = self.pipe.text_encoder(input_ids)[0].to(dtype=self.dtype)
+        self._prompt_cache[prompt] = prompt_embeds
+        return prompt_embeds
 
     @torch.no_grad()
+    def _encode_prompt_dit(self, prompt: str, batch_size: int, negative_prompt: str = "") -> tuple[torch.Tensor, torch.Tensor | None]:
+        cache_key = f"{prompt}||{negative_prompt}"
+        if cache_key in self._prompt_cache:
+            return self._prompt_cache[cache_key]
+
+        do_cfg = self.guidance_scale > 1.0 and negative_prompt is not None
+
+        (
+            _prompt_embeds,
+            _prompt_attention_mask,
+            _negative_prompt_embeds,
+            _negative_prompt_attention_mask,
+        ) = self.pipe.encode_prompt(
+            prompt=prompt,
+            device=self.device,
+            num_images_per_prompt=1,
+            do_classifier_free_guidance=do_cfg,
+            negative_prompt=negative_prompt if do_cfg else None,
+        )
+
+        if do_cfg:
+            prompt_embeds = torch.cat([_negative_prompt_embeds, _prompt_embeds], dim=0)
+            prompt_attention_mask = torch.cat([_negative_prompt_attention_mask, _prompt_attention_mask], dim=0)
+        else:
+            prompt_embeds = _prompt_embeds
+            prompt_attention_mask = _prompt_attention_mask
+
+        prompt_embeds = prompt_embeds.to(dtype=self.dtype)
+        result = (prompt_embeds, prompt_attention_mask)
+        self._prompt_cache[cache_key] = result
+        return result
+
+    @torch.no_grad()
+    def _null_prompt_embeddings(self, batch_size: int) -> torch.Tensor:
+        return self._encode_prompt("").expand(batch_size, -1, -1)
+
+    @torch.no_grad()
+    def _prompt_embeddings_for_labels(self, labels: torch.Tensor) -> torch.Tensor:
+        embeds: list[torch.Tensor] = []
+        for class_id in labels.tolist():
+            prompt = self.class_prompts.get(int(class_id), self._default_prompt)
+            embeds.append(self._encode_prompt(prompt))
+        return torch.cat(embeds, dim=0)
+
+    @torch.no_grad()
+    def _prompt_embeddings_for_labels_dit(self, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
+        cond_embeds_list: list[torch.Tensor] = []
+        cond_mask_list: list[torch.Tensor] = []
+        uncond_embeds_list: list[torch.Tensor] = []
+        uncond_mask_list: list[torch.Tensor] = []
+
+        for class_id in labels.tolist():
+            prompt = self.class_prompts.get(int(class_id), self._default_prompt)
+            embeds, mask = self._encode_prompt_dit(
+                prompt, batch_size=1,
+                negative_prompt="" if self.guidance_scale > 1.0 else "",
+            )
+            if self.guidance_scale > 1.0:
+                mid = embeds.shape[0] // 2
+                uncond_embeds_list.append(embeds[:mid])
+                cond_embeds_list.append(embeds[mid:])
+                if mask is not None:
+                    uncond_mask_list.append(mask[:mid])
+                    cond_mask_list.append(mask[mid:])
+            else:
+                cond_embeds_list.append(embeds)
+                if mask is not None:
+                    cond_mask_list.append(mask)
+
+        cond_embeds = torch.cat(cond_embeds_list, dim=0)
+        cond_mask = torch.cat(cond_mask_list, dim=0) if cond_mask_list else None
+
+        if self.guidance_scale > 1.0:
+            uncond_embeds = torch.cat(uncond_embeds_list, dim=0)
+            uncond_mask = torch.cat(uncond_mask_list, dim=0) if uncond_mask_list else None
+            prompt_embeds = torch.cat([uncond_embeds, cond_embeds], dim=0)
+            if uncond_mask is not None and cond_mask is not None:
+                prompt_attention_mask = torch.cat([uncond_mask, cond_mask], dim=0)
+            else:
+                prompt_attention_mask = None
+            return prompt_embeds, prompt_attention_mask
+
+        return cond_embeds, cond_mask
+
+    # ---------------------------------------------------------------- #
+    #  Decode — dispatch
+    # ---------------------------------------------------------------- #
+    @torch.no_grad()
     def _decode_batch(self, centers: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if self.backbone_type == "dit":
+            return self._decode_batch_dit(centers, labels)
+        return self._decode_batch_unet(centers, labels)
+
+    @torch.no_grad()
+    def _decode_batch_unet(self, centers: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
 
@@ -830,6 +1021,67 @@ class DiTDecoder:
         return (images / 2.0 + 0.5).clamp(0.0, 1.0)
 
     @torch.no_grad()
+    def _decode_batch_dit(self, centers: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        start_idx = int((1.0 - self.noise_strength) * (len(timesteps) - 1))
+        start_idx = max(0, min(start_idx, len(timesteps) - 1))
+        start_timestep = timesteps[start_idx]
+
+        latents = centers.to(device=self.device, dtype=self.dtype)
+        noise = torch.randn_like(latents)
+        latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
+
+        prompt_embeds, prompt_attention_mask = self._prompt_embeddings_for_labels_dit(labels)
+
+        batch_size = latents.size(0)
+        do_cfg = self.guidance_scale > 1.0
+
+        # Prepare resolution / aspect-ratio conditioning for PixArt
+        latent_h, latent_w = latents.shape[2], latents.shape[3]
+        image_h, image_w = latent_h * 8, latent_w * 8
+        has_sample_size = hasattr(self.pipe.transformer.config, "sample_size")
+
+        for timestep in timesteps[start_idx:]:
+            if do_cfg:
+                model_input = torch.cat([latents, latents], dim=0)
+            else:
+                model_input = latents
+
+            # Build added_cond_kwargs fresh each step (with correct batch dim)
+            step_added_cond: dict[str, torch.Tensor] = {}
+            if has_sample_size:
+                n = model_input.shape[0]
+                step_added_cond["resolution"] = torch.tensor([image_h, image_w]).repeat(n, 1).to(
+                    device=self.device, dtype=self.dtype
+                )
+                step_added_cond["aspect_ratio"] = torch.tensor([float(image_h / image_w)]).repeat(n, 1).to(
+                    device=self.device, dtype=self.dtype
+                )
+
+            noise_pred = self.pipe.transformer(
+                model_input,
+                encoder_hidden_states=prompt_embeds,
+                encoder_attention_mask=prompt_attention_mask,
+                timestep=timestep,
+                added_cond_kwargs=step_added_cond if step_added_cond else None,
+                return_dict=False,
+            )[0]
+
+            if do_cfg:
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+            latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
+
+        images = self.pipe.vae.decode(latents / self.scaling_factor).sample
+        return (images / 2.0 + 0.5).clamp(0.0, 1.0)
+
+    # ---------------------------------------------------------------- #
+    #  Public API
+    # ---------------------------------------------------------------- #
+    @torch.no_grad()
     def decode(self, centers: torch.Tensor, labels: torch.Tensor, batch_size: int) -> torch.Tensor:
         chunks: list[torch.Tensor] = []
         total = centers.size(0)
@@ -866,6 +1118,18 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     device = resolve_device(args.device)
     amp_enabled = bool(args.fp16 and device.type == "cuda")
     dataset_spec = get_dataset_spec(args.dataset)
+    backbone_type = _resolve_backbone_type(args.diffusion_model_id, args.backbone_type)
+    dit_image_size = int(args.dit_image_size)
+
+    # DiT models typically expect 256x256 input; override image_size when needed
+    effective_image_size = int(args.image_size)
+    if backbone_type == "dit" and effective_image_size != dit_image_size:
+        print(
+            f"[Setup] DiT backbone detected — overriding image_size from {effective_image_size} "
+            f"to {dit_image_size} (native DiT resolution). Set --dit-image-size to change."
+        )
+        effective_image_size = dit_image_size
+
     output_dir = Path(args.output_dir or f"outputs/{dataset_spec.name}_224_distill")
     teacher_baseline_dir = Path(args.teacher_baseline_dir or f"outputs/{dataset_spec.name}_224_distill_baseline")
     resolved_lora_path = resolve_lora_path(dataset_spec.name, args.lora_path)
@@ -881,7 +1145,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
         json.dump(run_config, handle, indent=2)
 
-    split_bundle = dataset_spec.load_dataset_splits(data_root=args.data_root, image_size=args.image_size)
+    split_bundle = dataset_spec.load_dataset_splits(data_root=args.data_root, image_size=effective_image_size)
     train_set = split_bundle.train_set
     val_set = split_bundle.val_set
     test_set = split_bundle.test_set
@@ -959,15 +1223,15 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         cache_path=latent_cache_path,
         expected_num_samples=len(train_set),
         expected_dataset=dataset_spec.name,
-        expected_vae_model_id=vae_model_id,
-        expected_image_size=args.image_size,
+        expected_vae_model_id=args.vae_model_id,
+        expected_image_size=effective_image_size,
     )
 
     latent_source = "cache"
     if cached_latents is None:
         encode_loader = build_encode_loader(
             train_set=train_set,
-            image_size=args.image_size,
+            image_size=effective_image_size,
             encode_batch_size=args.encode_batch_size,
             num_workers=args.num_workers,
             device=device,
@@ -985,8 +1249,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             latents=latents,
             labels=latent_labels,
             dataset_name=dataset_spec.name,
-            vae_model_id=vae_model_id,
-            image_size=args.image_size,
+            vae_model_id=args.vae_model_id,
+            image_size=effective_image_size,
         )
         latent_source = "vae_encoder"
     else:
@@ -1020,6 +1284,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             lora_path=resolved_lora_path,
             lora_scale=args.lora_scale,
             guidance_scale=args.guidance_scale,
+            backbone_type=args.backbone_type,
         )
 
         stream_iter = decoder.decode_batches(
@@ -1043,7 +1308,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         stream_iter = iter_images_by_indices(
             train_set=train_set,
             indices=selected.indices,
-            image_size=args.image_size,
+            image_size=effective_image_size,
             batch_size=stream_batch_size,
         )
         distilled_labels = expected_labels
@@ -1063,7 +1328,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         stream_iter = iter_images_by_indices(
             train_set=train_set,
             indices=selected.indices,
-            image_size=args.image_size,
+            image_size=effective_image_size,
             batch_size=stream_batch_size,
         )
         distilled_labels = expected_labels
@@ -1172,7 +1437,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         fkd_batch_cache = precompute_fkd_batch_cache(
             teacher=teacher,
             distilled_images=distilled_images_full,
-            image_size=args.image_size,
+            image_size=effective_image_size,
             batch_size=args.fkd_batch_size,
             train_epochs=args.fkd_train_epochs,
             crop_min_scale=args.fkd_crop_min_scale,
@@ -1292,7 +1557,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fkd-horizontal-flip-prob", type=float, default=0.5)
 
     parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse")
-    parser.add_argument("--diffusion-model-id", type=str, default="facebook/DiT-XL-2-256")
+    parser.add_argument("--diffusion-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
+    parser.add_argument("--backbone-type", type=str, default="auto",
+                        choices=["auto", "unet", "dit"],
+                        help="'auto' detects from model_id; 'unet' for SD; 'dit' for PixArt/DiT")
+    parser.add_argument("--dit-image-size", type=int, default=256,
+                        help="Resolution used when backbone_type is 'dit' (VAE encodes at this size, latents are size//8)")
     parser.add_argument("--lora-path", type=str, default="")
     parser.add_argument("--lora-scale", type=float, default=0.9)
     parser.add_argument("--guidance-scale", type=float, default=3.0)

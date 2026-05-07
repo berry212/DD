@@ -12,15 +12,22 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import nn
-from diffusers import AutoencoderKL, DDPMScheduler, DiTTransformer2DModel
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    PixArtAlphaPipeline,
+    StableDiffusionPipeline,
+    Transformer2DModel,
+    UNet2DConditionModel,
+)
 from diffusers.training_utils import cast_training_params
 from peft import LoraConfig, get_peft_model
-from peft.utils import get_peft_model_state_dict
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokenizer
 
 from .datasets import get_dataset_spec, supported_datasets
 
@@ -215,6 +222,120 @@ class MedMNISTClassDataset(Dataset[dict[str, torch.Tensor]]):
         }
 
 
+def resolve_backbone_type(model_id: str, backbone_type: str) -> str:
+    if backbone_type and backbone_type != "auto":
+        return backbone_type
+    model_lower = model_id.lower()
+    if any(kw in model_lower for kw in ("pixart", "dit", "transformer", "sd3", "flux")):
+        return "dit"
+    return "unet"
+
+
+class MedMNISTTextDatasetDiT(Dataset[dict[str, torch.Tensor]]):
+    """Like MedMNISTTextDataset but uses T5 tokenizer for PixArt-α / DiT."""
+
+    def __init__(
+        self,
+        split_data: Any,
+        sample_indices: np.ndarray,
+        tokenizer: T5Tokenizer,
+        resolution: int,
+        prompt_dropout_prob: float,
+        class_prompts: dict[int, str],
+        default_prompt: str,
+    ) -> None:
+        self.split_data = split_data
+        self.sample_indices = np.ascontiguousarray(sample_indices, dtype=np.int64)
+        self.tokenizer = tokenizer
+        self.prompts = dict(class_prompts)
+        self.default_prompt = default_prompt
+        self.prompt_dropout_prob = float(np.clip(prompt_dropout_prob, 0.0, 1.0))
+
+        if hasattr(split_data, "get_all_labels"):
+            self.labels = np.asarray(split_data.get_all_labels()).reshape(-1).astype(np.int64, copy=False)
+        else:
+            self.labels = np.asarray(split_data.labels).reshape(-1).astype(np.int64, copy=False)
+
+        self.images = split_data.imgs if hasattr(split_data, "imgs") else None
+        self._split_accessor = split_data if hasattr(split_data, "get_image_and_label") else None
+
+        self.transform = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(resolution),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ToTensor(),
+            ]
+        )
+
+    def __len__(self) -> int:
+        return int(self.sample_indices.shape[0])
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        source_idx = int(self.sample_indices[index])
+        if self._split_accessor is not None:
+            image, label = self._split_accessor.get_image_and_label(source_idx)
+        else:
+            image = self.images[source_idx]
+            label = int(self.labels[source_idx])
+
+        image = np.asarray(image)
+        label = int(label)
+        prompt = self.prompts.get(label, f"{self.default_prompt} class {label}")
+        if self.prompt_dropout_prob > 0.0 and random.random() < self.prompt_dropout_prob:
+            prompt = ""
+
+        pixel = self.transform(image)
+        pixel = pixel * 2.0 - 1.0
+
+        # T5 tokenization (different from CLIP)
+        text_inputs = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        input_ids = text_inputs.input_ids
+        attention_mask = text_inputs.attention_mask
+
+        return {
+            "pixel_values": pixel,
+            "input_ids": input_ids[0],
+            "attention_mask": attention_mask[0],
+        }
+
+
+def _save_dit_lora_weights(
+    transformer: Transformer2DModel,
+    lora_config: LoraConfig,
+    save_dir: Path,
+) -> None:
+    import json as _json
+    from safetensors.torch import save_file
+
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    state_dict = get_peft_model_state_dict(transformer)
+    save_file(state_dict, str(save_dir / "pytorch_lora_weights.safetensors"))
+
+    # Save PEFT config so distillate.py can reconstruct the adapter
+    config_dict = {
+        "r": lora_config.r,
+        "lora_alpha": lora_config.lora_alpha,
+        "target_modules": list(lora_config.target_modules),
+        "lora_dropout": lora_config.lora_dropout,
+        "bias": lora_config.bias,
+        "task_type": "CAUSAL_LM",  # generic enough for transformer
+        "peft_type": "LORA",
+        "init_lora_weights": lora_config.init_lora_weights,
+    }
+    with open(save_dir / "lora_config.json", "w", encoding="utf-8") as f:
+        _json.dump(config_dict, f, indent=2)
+    print(f"[LoRA-Train] Saved DiT LoRA to {save_dir}")
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -246,62 +367,115 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     print(f"[LoRA-Train] class_distribution={class_distribution}")
 
     weight_dtype = torch.float16 if args.fp16 and device.type == "cuda" else torch.float32
+    backbone_type = resolve_backbone_type(args.diffusion_model_id, args.backbone_type)
+    print(f"[LoRA-Train] backbone_type={backbone_type} model_id={args.diffusion_model_id}")
 
-    if args.base_model_id and not args.dit_model_id:
-        warnings.warn("--base-model-id is deprecated; use --dit-model-id.", RuntimeWarning)
+    if backbone_type == "dit":
+        # ---------- DiT / PixArt-α path ----------
+        tokenizer = T5Tokenizer.from_pretrained(args.diffusion_model_id, subfolder="tokenizer")
+        text_encoder = T5EncoderModel.from_pretrained(
+            args.diffusion_model_id, subfolder="text_encoder",
+            torch_dtype=weight_dtype,
+        )
+        vae = AutoencoderKL.from_pretrained(
+            args.diffusion_model_id, subfolder="vae", torch_dtype=weight_dtype
+        )
+        transformer = Transformer2DModel.from_pretrained(
+            args.diffusion_model_id, subfolder="transformer", torch_dtype=weight_dtype
+        )
+        noise_scheduler = DDPMScheduler.from_pretrained(args.diffusion_model_id, subfolder="scheduler")
 
-    dit_model_id = args.dit_model_id or args.base_model_id
-    vae_model_id = args.vae_model_id or dit_model_id
-    scheduler_model_id = args.scheduler_model_id or dit_model_id
+        # Move all encoders to GPU for training speed
+        vae.to(device)
+        text_encoder.to(device)
+        transformer.to(device)
 
-    transformer = load_dit_transformer(dit_model_id, dtype=weight_dtype)
-    vae = load_vae(vae_model_id, dtype=weight_dtype)
-    noise_scheduler = load_scheduler(scheduler_model_id)
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
 
-    transformer.to(device)
-    vae.to(device)
+        # Enable gradient checkpointing on T5 to reduce activation memory
+        if hasattr(text_encoder, "gradient_checkpointing_enable"):
+            text_encoder.gradient_checkpointing_enable()
+        transformer.requires_grad_(False)
 
-    transformer.requires_grad_(False)
-    vae.requires_grad_(False)
+        # Target both self-attn (attn1) and cross-attn (attn2) in DiT blocks
+        lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.lora_alpha,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+        # Enable gradient checkpointing on base model before PEFT wrap
+        if hasattr(transformer, "enable_gradient_checkpointing"):
+            try:
+                transformer.enable_gradient_checkpointing()
+            except Exception:
+                pass
 
-    target_modules = [v.strip() for v in args.lora_target_modules.split(",") if v.strip()]
-    if not target_modules:
-        raise ValueError("--lora-target-modules must provide at least one module name")
-
-    lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.lora_alpha,
-        init_lora_weights="gaussian",
-        target_modules=target_modules,
-    )
-    if hasattr(transformer, "add_adapter"):
-        transformer.add_adapter(lora_config)
-    else:
         transformer = get_peft_model(transformer, lora_config)
+        if weight_dtype == torch.float16 and device.type == "cuda":
+            cast_training_params(transformer, dtype=torch.float32)
+        transformer.train()
 
-    if weight_dtype == torch.float16 and device.type == "cuda":
-        cast_training_params(transformer, dtype=torch.float32)
-    transformer.train()
+        trainable_params = [p for p in transformer.parameters() if p.requires_grad]
+        trainable_param_count = int(sum(p.numel() for p in trainable_params))
+        print(f"[LoRA-Train] trainable_params={trainable_param_count}")
 
-    trainable_params = [p for p in transformer.parameters() if p.requires_grad]
-    trainable_param_count = int(sum(p.numel() for p in trainable_params))
-    print(f"[LoRA-Train] trainable_params={trainable_param_count}")
+        dataset = MedMNISTTextDatasetDiT(
+            split_data=train_split,
+            sample_indices=sample_indices,
+            tokenizer=tokenizer,
+            resolution=args.resolution,
+            prompt_dropout_prob=args.prompt_dropout_prob,
+            class_prompts=class_prompts,
+            default_prompt=default_prompt,
+        )
+    else:
+        # ---------- UNet / Stable Diffusion path ----------
+        tokenizer = CLIPTokenizer.from_pretrained(args.diffusion_model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(
+            args.diffusion_model_id, subfolder="text_encoder", torch_dtype=weight_dtype
+        )
+        vae = AutoencoderKL.from_pretrained(
+            args.diffusion_model_id, subfolder="vae", torch_dtype=weight_dtype
+        )
+        unet = UNet2DConditionModel.from_pretrained(
+            args.diffusion_model_id, subfolder="unet", torch_dtype=weight_dtype
+        )
+        noise_scheduler = DDPMScheduler.from_pretrained(args.diffusion_model_id, subfolder="scheduler")
 
-    num_classes = getattr(transformer.config, "num_classes", None)
-    if num_classes is not None and int(num_classes) > 0:
-        max_label = int(labels.max()) + int(args.class_label_offset) if labels.size > 0 else 0
-        if max_label >= int(num_classes):
-            raise ValueError(
-                f"Dataset labels exceed DiT num_classes (max_label={max_label}, num_classes={num_classes}). "
-                "Use --class-label-offset or a compatible DiT checkpoint."
-            )
+        text_encoder.to(device)
+        vae.to(device)
+        unet.to(device)
 
-    dataset = MedMNISTClassDataset(
-        split_data=train_split,
-        sample_indices=sample_indices,
-        resolution=args.resolution,
-        class_label_offset=args.class_label_offset,
-    )
+        vae.requires_grad_(False)
+        text_encoder.requires_grad_(False)
+        unet.requires_grad_(False)
+
+        lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.lora_alpha,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+        unet.add_adapter(lora_config)
+        if weight_dtype == torch.float16 and device.type == "cuda":
+            cast_training_params(unet, dtype=torch.float32)
+        unet.train()
+
+        trainable_params = [p for p in unet.parameters() if p.requires_grad]
+        trainable_param_count = int(sum(p.numel() for p in trainable_params))
+        print(f"[LoRA-Train] trainable_params={trainable_param_count}")
+
+        dataset = MedMNISTTextDataset(
+            split_data=train_split,
+            sample_indices=sample_indices,
+            tokenizer=tokenizer,
+            resolution=args.resolution,
+            prompt_dropout_prob=args.prompt_dropout_prob,
+            class_prompts=class_prompts,
+            default_prompt=default_prompt,
+        )
 
     sampler = create_class_balanced_sampler(labels) if args.class_balance else None
     data_loader = DataLoader(
@@ -334,6 +508,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     scaler = torch.amp.GradScaler(device="cuda", enabled=(weight_dtype == torch.float16 and device.type == "cuda"))
 
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        allocated_mb = torch.cuda.memory_allocated(device) / (1024 * 1024)
+        reserved_mb = torch.cuda.memory_reserved(device) / (1024 * 1024)
+        print(f"[LoRA-Train] GPU memory: allocated={allocated_mb:.0f} MiB  reserved={reserved_mb:.0f} MiB")
+
+    denoiser = transformer if backbone_type == "dit" else unet
+
     global_step = 0
     running_loss = 0.0
     running_steps = 0
@@ -343,11 +525,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for epoch in range(1, args.epochs + 1):
         for batch_idx, batch in enumerate(data_loader, start=1):
             pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
-            class_labels = batch["class_labels"].to(device)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * float(getattr(vae.config, "scaling_factor", 0.18215))
+
+                if backbone_type == "dit":
+                    # T5 on GPU with gradient checkpointing; clean up inputs after encoding
+                    input_ids = batch["input_ids"].to(device)
+                    attn_mask = batch.get("attention_mask", torch.ones_like(input_ids)).to(device)
+                    encoder_hidden_states = text_encoder(
+                        input_ids, attention_mask=attn_mask
+                    ).last_hidden_state
+                    del input_ids, attn_mask
+                else:
+                    input_ids = batch["input_ids"].to(device)
+                    encoder_hidden_states = text_encoder(input_ids)[0]
 
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
@@ -373,7 +566,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             noisy_latents = noise_scheduler.add_noise(latents, sampled_noise, timesteps)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(weight_dtype == torch.float16)):
-                model_pred = transformer(noisy_latents, timesteps, class_labels=class_labels).sample
+                if backbone_type == "dit":
+                    # PixArt requires resolution / aspect-ratio conditioning
+                    latent_h, latent_w = noisy_latents.shape[2], noisy_latents.shape[3]
+                    img_h, img_w = latent_h * 8, latent_w * 8
+                    bsz_dit = noisy_latents.shape[0]
+                    added_cond_kwargs = {
+                        "resolution": torch.tensor([img_h, img_w]).repeat(bsz_dit, 1).to(
+                            device=device, dtype=weight_dtype
+                        ),
+                        "aspect_ratio": torch.tensor([float(img_h / img_w)]).repeat(bsz_dit, 1).to(
+                            device=device, dtype=weight_dtype
+                        ),
+                    }
+                    model_pred = denoiser(
+                        hidden_states=noisy_latents,
+                        encoder_hidden_states=encoder_hidden_states,
+                        timestep=timesteps,
+                        added_cond_kwargs=added_cond_kwargs,
+                        return_dict=False,
+                    )[0]
+                    # PixArt learned-sigma: output has 2× channels, 1st half is noise
+                    if model_pred.shape[1] != latents.shape[1]:
+                        model_pred = model_pred.chunk(2, dim=1)[0]
+                else:
+                    model_pred = denoiser(noisy_latents, timesteps, encoder_hidden_states).sample
+                    # UNet learned-sigma: output has 2× channels, 1st half is noise
+                    if model_pred.shape[1] != latents.shape[1]:
+                        model_pred = model_pred.chunk(2, dim=1)[0]
+
                 if noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
@@ -434,18 +655,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.save_every_epoch:
             ckpt_dir = output_dir / f"checkpoint-epoch-{epoch:03d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            save_lora_artifacts(ckpt_dir, transformer, lora_config)
+            if backbone_type == "dit":
+                _save_dit_lora_weights(transformer=transformer, lora_config=lora_config, save_dir=ckpt_dir)
+            else:
+                unet_lora_state_dict = get_peft_model_state_dict(unet)
+                StableDiffusionPipeline.save_lora_weights(
+                    save_directory=str(ckpt_dir),
+                    unet_lora_layers=unet_lora_state_dict,
+                    safe_serialization=True,
+                )
 
         if stop_training:
             break
 
-    save_lora_artifacts(output_dir, transformer, lora_config)
+    if backbone_type == "dit":
+        _save_dit_lora_weights(transformer=transformer, lora_config=lora_config, save_dir=output_dir)
+    else:
+        unet_lora_state_dict = get_peft_model_state_dict(unet)
+        StableDiffusionPipeline.save_lora_weights(
+            save_directory=str(output_dir),
+            unet_lora_layers=unet_lora_state_dict,
+            safe_serialization=True,
+        )
 
     summary = {
         "dataset": dataset_spec.name,
-        "dit_model_id": str(dit_model_id),
-        "vae_model_id": str(vae_model_id),
-        "scheduler_model_id": str(scheduler_model_id),
+        "diffusion_model_id": args.diffusion_model_id,
+        "backbone_type": backbone_type,
         "data_root": str(data_root),
         "data_npz": str(Path(args.data_npz).expanduser()) if args.data_npz else "",
         "train_samples_used": int(len(dataset)),
@@ -492,15 +728,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default=str(default_data_root()))
     parser.add_argument("--data-npz", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")
-    parser.add_argument("--dit-model-id", type=str, default="facebook/DiT-XL-2-256")
-    parser.add_argument("--vae-model-id", type=str, default="")
-    parser.add_argument("--scheduler-model-id", type=str, default="")
-    parser.add_argument(
-        "--base-model-id",
-        type=str,
-        default="",
-        help="Deprecated alias for --dit-model-id.",
-    )
+    parser.add_argument("--diffusion-model-id", type=str, default="runwayml/stable-diffusion-v1-5",
+                        help="Diffusion model: SD1.5 for UNet, PixArt-alpha/PixArt-XL-2-1024-MS for DiT")
+    parser.add_argument("--backbone-type", type=str, default="auto",
+                        choices=["auto", "unet", "dit"],
+                        help="'auto' detects from model_id; 'unet' for SD; 'dit' for PixArt/DiT")
 
     parser.add_argument("--resolution", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=4)
