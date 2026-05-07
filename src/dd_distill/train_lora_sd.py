@@ -137,15 +137,15 @@ def strip_variance_channels(
     )
 
 
-def load_dit_transformer(model_id: str, dtype: torch.dtype) -> DiTTransformer2DModel:
+def load_dit_transformer(model_id: str, dtype: torch.dtype) -> Transformer2DModel:
     try:
-        return DiTTransformer2DModel.from_pretrained(
+        return Transformer2DModel.from_pretrained(
             model_id,
             subfolder="transformer",
             torch_dtype=dtype,
         )
     except Exception:
-        return DiTTransformer2DModel.from_pretrained(model_id, torch_dtype=dtype)
+        return Transformer2DModel.from_pretrained(model_id, torch_dtype=dtype)
 
 
 def load_vae(model_id: str, dtype: torch.dtype) -> AutoencoderKL:
@@ -229,6 +229,78 @@ def resolve_backbone_type(model_id: str, backbone_type: str) -> str:
     if any(kw in model_lower for kw in ("pixart", "dit", "transformer", "sd3", "flux")):
         return "dit"
     return "unet"
+
+
+class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
+    """CLIP-tokenized dataset for Stable Diffusion / UNet path."""
+
+    def __init__(
+        self,
+        split_data: Any,
+        sample_indices: np.ndarray,
+        tokenizer: CLIPTokenizer,
+        resolution: int,
+        prompt_dropout_prob: float,
+        class_prompts: dict[int, str],
+        default_prompt: str,
+    ) -> None:
+        self.split_data = split_data
+        self.sample_indices = np.ascontiguousarray(sample_indices, dtype=np.int64)
+        self.tokenizer = tokenizer
+        self.prompts = dict(class_prompts)
+        self.default_prompt = default_prompt
+        self.prompt_dropout_prob = float(np.clip(prompt_dropout_prob, 0.0, 1.0))
+
+        if hasattr(split_data, "get_all_labels"):
+            self.labels = np.asarray(split_data.get_all_labels()).reshape(-1).astype(np.int64, copy=False)
+        else:
+            self.labels = np.asarray(split_data.labels).reshape(-1).astype(np.int64, copy=False)
+
+        self.images = split_data.imgs if hasattr(split_data, "imgs") else None
+        self._split_accessor = split_data if hasattr(split_data, "get_image_and_label") else None
+
+        self.transform = transforms.Compose(
+            [
+                transforms.ToPILImage(),
+                transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(resolution),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ToTensor(),
+            ]
+        )
+
+    def __len__(self) -> int:
+        return int(self.sample_indices.shape[0])
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        source_idx = int(self.sample_indices[index])
+        if self._split_accessor is not None:
+            image, label = self._split_accessor.get_image_and_label(source_idx)
+        else:
+            image = self.images[source_idx]
+            label = int(self.labels[source_idx])
+
+        image = np.asarray(image)
+        label = int(label)
+        prompt = self.prompts.get(label, f"{self.default_prompt} class {label}")
+        if self.prompt_dropout_prob > 0.0 and random.random() < self.prompt_dropout_prob:
+            prompt = ""
+
+        pixel = self.transform(image)
+        pixel = pixel * 2.0 - 1.0
+
+        # CLIP tokenization
+        text_inputs = self.tokenizer(
+            prompt,
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+            padding="max_length",
+            return_tensors="pt",
+        )
+        return {
+            "pixel_values": pixel,
+            "input_ids": text_inputs.input_ids[0],
+        }
 
 
 class MedMNISTTextDatasetDiT(Dataset[dict[str, torch.Tensor]]):
@@ -366,6 +438,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     class_distribution = {int(k): int(v) for k, v in zip(label_values.tolist(), label_counts.tolist())}
     print(f"[LoRA-Train] class_distribution={class_distribution}")
 
+    class_prompts = dataset_spec.build_class_prompts()
+    default_prompt = dataset_spec.prompt_prefix
+    target_modules = [m.strip() for m in args.lora_target_modules.split(",") if m.strip()]
+
     weight_dtype = torch.float16 if args.fp16 and device.type == "cuda" else torch.float32
     backbone_type = resolve_backbone_type(args.diffusion_model_id, args.backbone_type)
     print(f"[LoRA-Train] backbone_type={backbone_type} model_id={args.diffusion_model_id}")
@@ -403,7 +479,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             r=args.rank,
             lora_alpha=args.lora_alpha,
             init_lora_weights="gaussian",
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            target_modules=target_modules,
         )
         # Enable gradient checkpointing on base model before PEFT wrap
         if hasattr(transformer, "enable_gradient_checkpointing"):
@@ -456,7 +532,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             r=args.rank,
             lora_alpha=args.lora_alpha,
             init_lora_weights="gaussian",
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+            target_modules=target_modules,
         )
         unet.add_adapter(lora_config)
         if weight_dtype == torch.float16 and device.type == "cuda":
