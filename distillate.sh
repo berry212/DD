@@ -26,6 +26,13 @@ SDE_NOISE_STRENGTH="${SDE_NOISE_STRENGTH:-0.2}"
 CLVQ_MEDOID_ANCHOR="${CLVQ_MEDOID_ANCHOR:-0.0}"
 WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-heuristic}"
 
+# ---- DiT settings ----
+BACKBONE_TYPE="${BACKBONE_TYPE:-auto}"
+DIT_MODEL_ID="${DIT_MODEL_ID:-PixArt-alpha/PixArt-XL-2-1024-MS}"
+DIT_IMAGE_SIZE="${DIT_IMAGE_SIZE:-256}"
+DECODE_BATCH_SIZE="${DECODE_BATCH_SIZE:-4}"
+ENCODE_BATCH_SIZE="${ENCODE_BATCH_SIZE:-32}"
+
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 TRAIN_CROP_MIN_SCALE="${TRAIN_CROP_MIN_SCALE:-0.08}"
@@ -38,7 +45,12 @@ TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-20.0}"
 if [[ -n "${LORA_PATH:-}" ]]; then
   LORA_PATH="${LORA_PATH}"
 else
-  LORA_PATH="outputs/lora_${DATASET}"
+  # DiT LoRA uses a different default directory
+  if [[ "$BACKBONE_TYPE" == "dit" ]]; then
+    LORA_PATH="outputs/lora_dit_${DATASET}"
+  else
+    LORA_PATH="outputs/lora_${DATASET}"
+  fi
   if [[ "$DATASET" == "dermamnist" && ! -d "$LORA_PATH" && -d "outputs/lora_dreammnist" ]]; then
     LORA_PATH="outputs/lora_dreammnist"
   fi
@@ -78,10 +90,21 @@ if [[ ! -f "${BASELINE_DIR}/teacher_best.pt" ]]; then
   fi
 fi
 
+# Resolve diffusion model ID based on backbone type
+if [[ "$BACKBONE_TYPE" == "dit" ]]; then
+  DIFFUSION_MODEL_ID="$DIT_MODEL_ID"
+else
+  DIFFUSION_MODEL_ID="${DIFFUSION_MODEL_ID:-runwayml/stable-diffusion-v1-5}"
+fi
+
 FKD_PRECOMPUTE_FLAG="--fkd-precompute-batches"
 if [[ "$FKD_PRECOMPUTE_BATCHES" == "false" ]]; then
   FKD_PRECOMPUTE_FLAG="--no-fkd-precompute-batches"
 fi
+
+echo "[Distill] backbone_type=$BACKBONE_TYPE diffusion_model=$DIFFUSION_MODEL_ID"
+echo "[Distill] lora_path=$LORA_PATH"
+echo "[Distill] decode_batch_size=$DECODE_BATCH_SIZE"
 
 uv run run-distillation \
   --dataset "$DATASET" \
@@ -89,7 +112,9 @@ uv run run-distillation \
   --output-dir "$OUTPUT_DIR" \
   --teacher-baseline-dir "$BASELINE_DIR" \
   --vae-model-id stabilityai/sd-vae-ft-mse \
-  --diffusion-model-id runwayml/stable-diffusion-v1-5 \
+  --diffusion-model-id "$DIFFUSION_MODEL_ID" \
+  --backbone-type "$BACKBONE_TYPE" \
+  --dit-image-size "$DIT_IMAGE_SIZE" \
   --lora-path "$LORA_PATH" \
   --lora-scale 0.9 \
   --guidance-scale "$GUIDANCE_SCALE" \
@@ -106,8 +131,8 @@ uv run run-distillation \
   --no-auto-train-teacher-baseline \
   --sde-steps "$SDE_STEPS" \
   --sde-noise-strength "$SDE_NOISE_STRENGTH" \
-  --encode-batch-size 32 \
-  --decode-batch-size 4 \
+  --encode-batch-size "$ENCODE_BATCH_SIZE" \
+  --decode-batch-size "$DECODE_BATCH_SIZE" \
   "$FKD_PRECOMPUTE_FLAG" \
   --fkd-train-epochs "$TRAIN_EPOCHS" \
   --fkd-batch-size "$TRAIN_BATCH_SIZE" \

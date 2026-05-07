@@ -18,19 +18,21 @@ DATASET="${DATASET:-dermamnist}"
 #     DISTILL_METHOD=kmeans DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
 # done
 
-for IPC in 0.2 0.4 0.6; do
+for IPC in 200 100 50 10; do
     DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
     DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
 done
 
-# DATASET="bloodmnist"
+DATASET="bloodmnist"
 
-# for IPC in 0.2 0.4 0.6 0.8; do
-#     DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
-#     DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
-# done
+for IPC in 200 100 50 10; do
+    DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
+    DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
+done
 
-# for IPC in 100 200; do
-#     DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
-#     DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
-# done
+DATASET="aptos"
+
+for IPC in 200 100 50 10; do
+    DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
+    DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
+done

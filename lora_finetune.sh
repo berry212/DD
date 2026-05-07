@@ -37,7 +37,8 @@ uv run run-train-lora-sd \
   --dataset "$DATASET" \
   --data-root "$DATA_ROOT" \
   --output-dir "$OUTPUT_DIR" \
-  --base-model-id runwayml/stable-diffusion-v1-5 \
+  --diffusion-model-id runwayml/stable-diffusion-v1-5 \
+  --backbone-type unet \
   --resolution 224 \
   --batch-size 4 \
   --gradient-accumulation-steps 2 \
