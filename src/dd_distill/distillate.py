@@ -10,7 +10,7 @@ from typing import Any, Iterator
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, DDIMScheduler, StableDiffusionPipeline
+from diffusers import AutoencoderKL, DDIMScheduler, DiTPipeline, StableDiffusionPipeline
 from sklearn.cluster import KMeans, MiniBatchKMeans
 from torch import nn
 from torch.utils.data import DataLoader
@@ -827,6 +827,129 @@ class ReverseSDEDecoder:
             torch.cuda.empty_cache()
 
 
+class DiTDecoder:
+    """Reverse diffusion decoder using DiT (class-conditional) instead of SD (text-conditional)."""
+
+    def __init__(
+        self,
+        model_id: str,
+        vae: AutoencoderKL,
+        device: torch.device,
+        dtype: torch.dtype,
+        num_inference_steps: int,
+        noise_strength: float,
+        lora_path: str,
+        lora_scale: float,
+        output_size: int = 224,
+    ) -> None:
+        self.device = device
+        self.dtype = dtype
+        self.num_inference_steps = max(2, int(num_inference_steps))
+        self.noise_strength = float(np.clip(noise_strength, 0.01, 1.0))
+        self.output_size = int(output_size)
+        self.scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215))
+
+        kwargs: dict[str, Any] = {
+            "torch_dtype": dtype,
+            "vae": vae,
+        }
+        try:
+            self.pipe = DiTPipeline.from_pretrained(model_id, **kwargs)
+        except Exception:
+            self.pipe = DiTPipeline.from_pretrained(model_id, torch_dtype=dtype, vae=vae)
+
+        self.pipe.to(device)
+        self.pipe.set_progress_bar_config(disable=True)
+        self.scheduler = DDIMScheduler.from_config(self.pipe.scheduler.config)
+
+        if lora_path:
+            self._load_lora(lora_path=lora_path, lora_scale=lora_scale)
+
+    def _load_lora(self, lora_path: str, lora_scale: float) -> None:
+        from peft import PeftModel
+
+        adapter_dir = Path(lora_path)
+        if not adapter_dir.exists():
+            warnings.warn(f"LoRA path does not exist: {adapter_dir}. Continue without LoRA.", RuntimeWarning)
+            return
+
+        try:
+            self.pipe.transformer = PeftModel.from_pretrained(
+                self.pipe.transformer, str(adapter_dir)
+            )
+            self.pipe.transformer = self.pipe.transformer.merge_and_unload()
+            print(f"[DiT-LoRA] Loaded and merged adapter from {adapter_dir}")
+        except Exception:
+            warnings.warn("Failed to load DiT LoRA, continue without LoRA.", RuntimeWarning)
+            return
+
+    @torch.no_grad()
+    def _decode_batch(self, centers: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        start_idx = int((1.0 - self.noise_strength) * (len(timesteps) - 1))
+        start_idx = max(0, min(start_idx, len(timesteps) - 1))
+        start_timestep = timesteps[start_idx]
+
+        latents = centers.to(device=self.device, dtype=self.dtype)
+        noise = torch.randn_like(latents)
+        latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
+        class_labels = labels.to(device=self.device, dtype=torch.long)
+
+        for timestep in timesteps[start_idx:]:
+            model_input = self.scheduler.scale_model_input(latents, timestep)
+            # DiT requires 1D timestep tensor; DDIM scheduler gives scalar
+            t_batch = timestep.expand(latents.size(0))
+            noise_pred = self.pipe.transformer(
+                model_input, t_batch, class_labels=class_labels
+            ).sample
+            # DiT outputs 8 channels (noise+variance), use only first 4
+            if noise_pred.size(1) == 8:
+                noise_pred = noise_pred[:, :4]
+            latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
+
+        images = self.pipe.vae.decode(latents / self.scaling_factor).sample
+        images = (images / 2.0 + 0.5).clamp(0.0, 1.0)
+
+        # Resize back to target resolution for downstream training
+        if images.shape[-1] != self.output_size:
+            images = F.interpolate(images, size=(self.output_size, self.output_size),
+                                   mode="bilinear", align_corners=False)
+        return images
+
+    @torch.no_grad()
+    def decode(self, centers: torch.Tensor, labels: torch.Tensor, batch_size: int) -> torch.Tensor:
+        chunks: list[torch.Tensor] = []
+        total = centers.size(0)
+        for start in range(0, total, batch_size):
+            end = min(total, start + batch_size)
+            imgs = self._decode_batch(centers[start:end], labels[start:end])
+            chunks.append(imgs.float().cpu())
+            print(f"[DiT-Decoding] {end}/{total}")
+        return torch.cat(chunks, dim=0)
+
+    @torch.no_grad()
+    def decode_batches(
+        self,
+        centers: torch.Tensor,
+        labels: torch.Tensor,
+        batch_size: int,
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        total = centers.size(0)
+        chunk_size = max(1, int(batch_size))
+        for start in range(0, total, chunk_size):
+            end = min(total, start + chunk_size)
+            imgs = self._decode_batch(centers[start:end], labels[start:end])
+            print(f"[DiT-Decoding] {end}/{total}")
+            yield imgs.float().cpu(), labels[start:end].long().cpu()
+
+    def cleanup(self) -> None:
+        del self.pipe
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
     device = resolve_device(args.device)
@@ -844,6 +967,11 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     run_config["lora_path"] = resolved_lora_path
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as handle:
         json.dump(run_config, handle, indent=2)
+
+    is_dit = args.model_type == "dit"
+    encode_image_size = 256 if is_dit else args.image_size
+    if is_dit:
+        print(f"[Setup] Using DiT mode: encode_image_size={encode_image_size}, final_image_size={args.image_size}")
 
     split_bundle = dataset_spec.load_dataset_splits(data_root=args.data_root, image_size=args.image_size)
     train_set = split_bundle.train_set
@@ -915,6 +1043,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     # Latents are independent of IPC, so cache them under dataset baseline dir.
     latent_cache_path = teacher_baseline_dir / "train_latents.pt"
+    if is_dit:
+        latent_cache_path = teacher_baseline_dir / f"train_latents_{encode_image_size}.pt"
     vae_dtype = torch.float16 if amp_enabled else torch.float32
     vae, scaling_factor = load_vae(args.vae_model_id, device=device, dtype=vae_dtype)
 
@@ -923,14 +1053,14 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         expected_num_samples=len(train_set),
         expected_dataset=dataset_spec.name,
         expected_vae_model_id=args.vae_model_id,
-        expected_image_size=args.image_size,
+        expected_image_size=encode_image_size,
     )
 
     latent_source = "cache"
     if cached_latents is None:
         encode_loader = build_encode_loader(
             train_set=train_set,
-            image_size=args.image_size,
+            image_size=encode_image_size,
             encode_batch_size=args.encode_batch_size,
             num_workers=args.num_workers,
             device=device,
@@ -949,7 +1079,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             labels=latent_labels,
             dataset_name=dataset_spec.name,
             vae_model_id=args.vae_model_id,
-            image_size=args.image_size,
+            image_size=encode_image_size,
         )
         latent_source = "vae_encoder"
     else:
@@ -957,7 +1087,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     stream_batch_size = max(1, int(args.save_batch_size))
 
-    decoder: ReverseSDEDecoder | None = None
+    decoder: ReverseSDEDecoder | DiTDecoder | None = None
 
     if args.distill_method == "clvq":
         clvq = classwise_clvq(
@@ -973,19 +1103,32 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             weighting_strategy=args.weighting_strategy,
         )
 
-        class_prompts = dataset_spec.build_class_prompts()
-        decoder = ReverseSDEDecoder(
-            model_id=args.diffusion_model_id,
-            vae=vae,
-            device=device,
-            dtype=vae_dtype,
-            num_inference_steps=args.sde_steps,
-            noise_strength=args.sde_noise_strength,
-            lora_path=resolved_lora_path,
-            lora_scale=args.lora_scale,
-            class_prompts=class_prompts,
-            guidance_scale=args.guidance_scale,
-        )
+        if is_dit:
+            decoder = DiTDecoder(
+                model_id=args.diffusion_model_id,
+                vae=vae,
+                device=device,
+                dtype=vae_dtype,
+                num_inference_steps=args.sde_steps,
+                noise_strength=args.sde_noise_strength,
+                lora_path=resolved_lora_path,
+                lora_scale=args.lora_scale,
+                output_size=args.image_size,
+            )
+        else:
+            class_prompts = dataset_spec.build_class_prompts()
+            decoder = ReverseSDEDecoder(
+                model_id=args.diffusion_model_id,
+                vae=vae,
+                device=device,
+                dtype=vae_dtype,
+                num_inference_steps=args.sde_steps,
+                noise_strength=args.sde_noise_strength,
+                lora_path=resolved_lora_path,
+                lora_scale=args.lora_scale,
+                class_prompts=class_prompts,
+                guidance_scale=args.guidance_scale,
+            )
 
         stream_iter = decoder.decode_batches(
             clvq.centers,
@@ -1185,6 +1328,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     summary = {
         "dataset": dataset_spec.name,
+        "model_type": args.model_type,
+        "diffusion_model_id": args.diffusion_model_id,
         "data_root": args.data_root,
         "teacher_baseline_dir": str(teacher_baseline_dir),
         "teacher_checkpoint": str(teacher_ckpt_path),
@@ -1256,6 +1401,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--diffusion-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
+    parser.add_argument("--model-type", type=str, choices=["sd", "dit"], default="sd",
+                        help="Diffusion model type: sd (Stable Diffusion) or dit (DiT-XL-2-256)")
     parser.add_argument("--lora-path", type=str, default="")
     parser.add_argument("--lora-scale", type=float, default=0.9)
     parser.add_argument("--guidance-scale", type=float, default=3.0)

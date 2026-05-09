@@ -112,20 +112,19 @@ def build_eval_loaders(
     num_workers: int,
     device: torch.device,
 ) -> tuple[DataLoader[tuple[torch.Tensor, torch.Tensor]], DataLoader[tuple[torch.Tensor, torch.Tensor]]]:
-    pin_memory = device.type == "cuda"
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
         TorchDataset(val_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=pin_memory,
+        pin_memory=False,
     )
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
         TorchDataset(test_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=pin_memory,
+        pin_memory=False,
     )
     return val_loader, test_loader
 
@@ -828,7 +827,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             train_set,
             batch_size=1,
             shuffle=False,
-            num_workers=args.num_workers,
+            num_workers=0,
             pin_memory=(device.type == "cuda"),
             collate_fn=unwrap_single_batch,
         )

@@ -226,7 +226,7 @@ def summarize_teacher_model(
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,
     )
 
     baseline_eval = evaluate_teacher_baseline_metrics(
@@ -285,21 +285,21 @@ def train_teacher_baseline(
         batch_size=args.teacher_batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,
     )
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
         TorchDataset(val_set, transform=eval_transform),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,
     )
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
         TorchDataset(test_set, transform=eval_transform),
         batch_size=args.eval_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,
     )
 
     teacher = build_classifier(

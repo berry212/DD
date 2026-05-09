@@ -25,6 +25,15 @@ SDE_STEPS="${SDE_STEPS:-200}"
 SDE_NOISE_STRENGTH="${SDE_NOISE_STRENGTH:-0.2}"
 CLVQ_MEDOID_ANCHOR="${CLVQ_MEDOID_ANCHOR:-0.0}"
 WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-heuristic}"
+MODEL_TYPE="${MODEL_TYPE:-sd}"
+
+if [[ "$MODEL_TYPE" == "dit" ]]; then
+  DIFFUSION_MODEL_ID="facebook/DiT-XL-2-256"
+  MODEL_ARGS=(--model-type dit)
+else
+  DIFFUSION_MODEL_ID="runwayml/stable-diffusion-v1-5"
+  MODEL_ARGS=()
+fi
 
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
@@ -89,7 +98,8 @@ uv run run-distillation \
   --output-dir "$OUTPUT_DIR" \
   --teacher-baseline-dir "$BASELINE_DIR" \
   --vae-model-id stabilityai/sd-vae-ft-mse \
-  --diffusion-model-id runwayml/stable-diffusion-v1-5 \
+  --diffusion-model-id "$DIFFUSION_MODEL_ID" \
+  "${MODEL_ARGS[@]}" \
   --lora-path "$LORA_PATH" \
   --lora-scale 0.9 \
   --guidance-scale "$GUIDANCE_SCALE" \

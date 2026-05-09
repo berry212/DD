@@ -11,9 +11,9 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, DiTPipeline, DiTTransformer2DModel, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.training_utils import cast_training_params
-from peft import LoraConfig
+from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -118,6 +118,7 @@ class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
         prompt_dropout_prob: float,
         class_prompts: dict[int, str],
         default_prompt: str,
+        return_class_label: bool = False,
     ) -> None:
         self.split_data = split_data
         self.sample_indices = np.ascontiguousarray(sample_indices, dtype=np.int64)
@@ -125,6 +126,7 @@ class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
         self.prompts = dict(class_prompts)
         self.default_prompt = default_prompt
         self.prompt_dropout_prob = float(np.clip(prompt_dropout_prob, 0.0, 1.0))
+        self.return_class_label = bool(return_class_label)
 
         if hasattr(split_data, "get_all_labels"):
             self.labels = np.asarray(split_data.get_all_labels()).reshape(-1).astype(np.int64, copy=False)
@@ -164,18 +166,24 @@ class MedMNISTTextDataset(Dataset[dict[str, torch.Tensor]]):
         pixel = self.transform(image)
         pixel = pixel * 2.0 - 1.0
 
-        input_ids = self.tokenizer(
-            prompt,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-            padding="max_length",
-            return_tensors="pt",
-        ).input_ids[0]
+        if self.tokenizer is not None:
+            input_ids = self.tokenizer(
+                prompt,
+                truncation=True,
+                max_length=self.tokenizer.model_max_length,
+                padding="max_length",
+                return_tensors="pt",
+            ).input_ids[0]
+        else:
+            input_ids = torch.zeros(1, dtype=torch.long)  # placeholder for DiT
 
-        return {
+        result: dict[str, torch.Tensor] = {
             "pixel_values": pixel,
             "input_ids": input_ids,
         }
+        if self.return_class_label:
+            result["class_labels"] = torch.tensor(label, dtype=torch.long)
+        return result
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -208,21 +216,34 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     class_distribution = {int(k): int(v) for k, v in zip(label_values.tolist(), label_counts.tolist())}
     print(f"[LoRA-Train] class_distribution={class_distribution}")
 
+    is_dit = args.model_type == "dit"
+    train_resolution = 256 if is_dit else args.resolution
     weight_dtype = torch.float16 if args.fp16 and device.type == "cuda" else torch.float32
 
-    tokenizer = CLIPTokenizer.from_pretrained(args.base_model_id, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.base_model_id, subfolder="text_encoder", torch_dtype=weight_dtype)
-    vae = AutoencoderKL.from_pretrained(args.base_model_id, subfolder="vae", torch_dtype=weight_dtype)
-    unet = UNet2DConditionModel.from_pretrained(args.base_model_id, subfolder="unet", torch_dtype=weight_dtype)
-    noise_scheduler = DDPMScheduler.from_pretrained(args.base_model_id, subfolder="scheduler")
+    if is_dit:
+        print(f"[LoRA-Train] Using DiT-XL-2-256, train_resolution={train_resolution}")
+        dit_model_id = args.dit_model_id or "facebook/DiT-XL-2-256"
+        vae = AutoencoderKL.from_pretrained(dit_model_id, subfolder="vae", torch_dtype=weight_dtype)
+        diffusion_model = DiTTransformer2DModel.from_pretrained(dit_model_id, subfolder="transformer", torch_dtype=weight_dtype)
+        noise_scheduler = DDPMScheduler.from_pretrained(dit_model_id, subfolder="scheduler")
+        tokenizer = None
+        text_encoder = None
+    else:
+        tokenizer = CLIPTokenizer.from_pretrained(args.base_model_id, subfolder="tokenizer")
+        text_encoder = CLIPTextModel.from_pretrained(args.base_model_id, subfolder="text_encoder", torch_dtype=weight_dtype)
+        vae = AutoencoderKL.from_pretrained(args.base_model_id, subfolder="vae", torch_dtype=weight_dtype)
+        diffusion_model = UNet2DConditionModel.from_pretrained(args.base_model_id, subfolder="unet", torch_dtype=weight_dtype)
+        noise_scheduler = DDPMScheduler.from_pretrained(args.base_model_id, subfolder="scheduler")
 
-    text_encoder.to(device)
     vae.to(device)
-    unet.to(device)
+    diffusion_model.to(device)
+    if text_encoder is not None:
+        text_encoder.to(device)
 
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    unet.requires_grad_(False)
+    if text_encoder is not None:
+        text_encoder.requires_grad_(False)
+    diffusion_model.requires_grad_(False)
 
     lora_config = LoraConfig(
         r=args.rank,
@@ -230,12 +251,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
-    unet.add_adapter(lora_config)
+    if is_dit:
+        diffusion_model = get_peft_model(diffusion_model, lora_config)
+    else:
+        diffusion_model.add_adapter(lora_config)
     if weight_dtype == torch.float16 and device.type == "cuda":
-        cast_training_params(unet, dtype=torch.float32)
-    unet.train()
+        cast_training_params(diffusion_model, dtype=torch.float32)
+    diffusion_model.train()
 
-    trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    trainable_params = [p for p in diffusion_model.parameters() if p.requires_grad]
     trainable_param_count = int(sum(p.numel() for p in trainable_params))
     print(f"[LoRA-Train] trainable_params={trainable_param_count}")
 
@@ -243,10 +267,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         split_data=train_split,
         sample_indices=sample_indices,
         tokenizer=tokenizer,
-        resolution=args.resolution,
+        resolution=train_resolution,
         prompt_dropout_prob=args.prompt_dropout_prob,
         class_prompts=class_prompts,
         default_prompt=default_prompt,
+        return_class_label=is_dit,
     )
 
     sampler = create_class_balanced_sampler(labels) if args.class_balance else None
@@ -289,12 +314,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     for epoch in range(1, args.epochs + 1):
         for batch_idx, batch in enumerate(data_loader, start=1):
             pixel_values = batch["pixel_values"].to(device=device, dtype=weight_dtype)
-            input_ids = batch["input_ids"].to(device)
 
             with torch.no_grad():
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * float(getattr(vae.config, "scaling_factor", 0.18215))
-                encoder_hidden_states = text_encoder(input_ids)[0]
+                if is_dit:
+                    cond_kwargs: dict[str, torch.Tensor] = {"class_labels": batch["class_labels"].to(device)}
+                else:
+                    input_ids = batch["input_ids"].to(device)
+                    encoder_hidden_states = text_encoder(input_ids)[0]
+                    cond_kwargs = {"encoder_hidden_states": encoder_hidden_states}
 
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
@@ -320,7 +349,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             noisy_latents = noise_scheduler.add_noise(latents, sampled_noise, timesteps)
 
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=(weight_dtype == torch.float16)):
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = diffusion_model(noisy_latents, timesteps, **cond_kwargs).sample
+                # DiT outputs 8 channels (noise + variance), use only first 4 for noise
+                if is_dit and model_pred.size(1) == 8:
+                    model_pred = model_pred[:, :4]
                 if noise_scheduler.config.prediction_type == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
@@ -375,25 +407,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.save_every_epoch:
             ckpt_dir = output_dir / f"checkpoint-epoch-{epoch:03d}"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-            unet_lora_state_dict = get_peft_model_state_dict(unet)
-            StableDiffusionPipeline.save_lora_weights(
-                save_directory=str(ckpt_dir),
-                unet_lora_layers=unet_lora_state_dict,
-                safe_serialization=True,
-            )
+            if is_dit:
+                diffusion_model.save_pretrained(str(ckpt_dir))
+            else:
+                lora_state_dict = get_peft_model_state_dict(diffusion_model)
+                StableDiffusionPipeline.save_lora_weights(
+                    save_directory=str(ckpt_dir),
+                    unet_lora_layers=lora_state_dict,
+                    safe_serialization=True,
+                )
 
         if stop_training:
             break
 
-    unet_lora_state_dict = get_peft_model_state_dict(unet)
-    StableDiffusionPipeline.save_lora_weights(
-        save_directory=str(output_dir),
-        unet_lora_layers=unet_lora_state_dict,
-        safe_serialization=True,
-    )
+    if is_dit:
+        diffusion_model.save_pretrained(str(output_dir))
+    else:
+        lora_state_dict = get_peft_model_state_dict(diffusion_model)
+        StableDiffusionPipeline.save_lora_weights(
+            save_directory=str(output_dir),
+            unet_lora_layers=lora_state_dict,
+            safe_serialization=True,
+        )
 
     summary = {
         "dataset": dataset_spec.name,
+        "model_type": args.model_type,
         "base_model_id": args.base_model_id,
         "data_root": str(data_root),
         "data_npz": str(Path(args.data_npz).expanduser()) if args.data_npz else "",
@@ -441,6 +480,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-npz", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--base-model-id", type=str, default="runwayml/stable-diffusion-v1-5")
+    parser.add_argument("--model-type", type=str, choices=["sd", "dit"], default="sd",
+                        help="Diffusion model type: sd (Stable Diffusion) or dit (DiT-XL-2-256)")
+    parser.add_argument("--dit-model-id", type=str, default="facebook/DiT-XL-2-256",
+                        help="DiT model ID on HuggingFace (used when --model-type=dit)")
 
     parser.add_argument("--resolution", type=int, default=224)
     parser.add_argument("--batch-size", type=int, default=4)

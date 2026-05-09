@@ -12,6 +12,13 @@ fi
 
 DATA_ROOT="${DATA_ROOT:-${HF_DATASETS_CACHE:-${HF_HOME:-data}}}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/lora_${DATASET}}"
+MODEL_TYPE="${MODEL_TYPE:-sd}"
+
+if [[ "$MODEL_TYPE" == "dit" ]]; then
+  MODEL_ARGS=(--model-type dit --dit-model-id facebook/DiT-XL-2-256)
+else
+  MODEL_ARGS=(--base-model-id runwayml/stable-diffusion-v1-5)
+fi
 
 if [[ "$DATASET" == "odir-5k" ]]; then
   if [[ ! -d "$DATA_ROOT/ODIR-5K" ]]; then
@@ -37,7 +44,7 @@ uv run run-train-lora-sd \
   --dataset "$DATASET" \
   --data-root "$DATA_ROOT" \
   --output-dir "$OUTPUT_DIR" \
-  --base-model-id runwayml/stable-diffusion-v1-5 \
+  "${MODEL_ARGS[@]}" \
   --resolution 224 \
   --batch-size 4 \
   --gradient-accumulation-steps 2 \
