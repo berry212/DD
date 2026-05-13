@@ -140,6 +140,7 @@ class DistilledDataBundle:
     dataset: str
     lora_path: str
     teacher_temperature: float
+    distill_method: str
     fkd_batch_path: str
     fkd_batch_summary: dict[str, Any]
 
@@ -166,6 +167,7 @@ def load_distilled_triplet(distilled_data_path: Path) -> DistilledDataBundle:
     distilled_dataset = str(payload.get("dataset", "")).strip().lower()
     distilled_lora_path = str(payload.get("lora_path", "")).strip()
     teacher_temperature = float(payload.get("teacher_temperature", 0.0) or 0.0)
+    distill_method = str(payload.get("distill_method", "clvq")).strip().lower()
     fkd_batch_path = str(payload.get("fkd_batch_path", "")).strip()
     fkd_batch_summary_obj = payload.get("fkd_batch_summary")
     fkd_batch_summary = dict(fkd_batch_summary_obj) if isinstance(fkd_batch_summary_obj, dict) else {}
@@ -234,6 +236,7 @@ def load_distilled_triplet(distilled_data_path: Path) -> DistilledDataBundle:
         dataset=distilled_dataset,
         lora_path=distilled_lora_path,
         teacher_temperature=teacher_temperature,
+        distill_method=distill_method,
         fkd_batch_path=fkd_batch_path,
         fkd_batch_summary=fkd_batch_summary,
     )
@@ -785,6 +788,16 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         requested_temperature=args.kd_temperature,
         distilled_teacher_temperature=distilled_bundle.teacher_temperature,
     )
+
+    # ── Random / KMeans distillation → use hard labels (one‑hot) ──
+    resolved_hard_label_alpha = float(np.clip(args.hard_label_alpha, 0.0, 1.0))
+    if distilled_bundle.distill_method in {"random", "kmeans"}:
+        if resolved_hard_label_alpha < 1.0:
+            print(
+                f"[Setup] distill_method={distilled_bundle.distill_method} → "
+                f"forcing hard_label_alpha=1.0 (was {resolved_hard_label_alpha})"
+            )
+            resolved_hard_label_alpha = 1.0
     fkd_batches_used = 0
 
     if bool(args.use_fkd_batches) and distilled_bundle.fkd_batch_path:
@@ -828,7 +841,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             batch_size=1,
             shuffle=False,
             num_workers=0,
-            pin_memory=(device.type == "cuda"),
+            pin_memory=False,
             collate_fn=unwrap_single_batch,
         )
         train_mode = "fkd_batches"
@@ -862,7 +875,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             batch_size=effective_train_batch_size,
             shuffle=True,
             num_workers=args.num_workers,
-            pin_memory=(device.type == "cuda"),
+            pin_memory=False,
         )
 
     model = build_classifier(
@@ -885,7 +898,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         amp_enabled=amp_enabled,
         output_dir=output_dir,
         kd_temperature=resolved_kd_temperature,
-        hard_label_alpha=args.hard_label_alpha,
+        hard_label_alpha=resolved_hard_label_alpha,
     )
 
     best_ckpt = torch.load(output_dir / "student_best.pt", map_location=device)
@@ -934,7 +947,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "train_batch_size": int(effective_train_batch_size),
         "kd_temperature": float(resolved_kd_temperature),
         "distilled_teacher_temperature": float(distilled_bundle.teacher_temperature),
-        "hard_label_alpha": float(args.hard_label_alpha),
+        "hard_label_alpha": float(resolved_hard_label_alpha),
         "weight_balance_alpha": float(args.weight_balance_alpha),
         "soft_label_sharpen": float(args.soft_label_sharpen),
         "best_epoch": int(training_summary["best_epoch"]),

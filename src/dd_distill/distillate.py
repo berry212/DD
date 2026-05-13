@@ -59,6 +59,116 @@ def make_teacher_soft_labels(
     return torch.cat(soft_targets, dim=0)
 
 
+@torch.no_grad()
+def teacher_confidence_scores(
+    teacher: nn.Module,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Compute teacher softmax probability for the target class of each image.
+
+    Returns a 1‑D tensor of shape (N,) where each entry is p_target ∈ [0,1].
+    """
+    teacher.eval()
+    confidences: list[torch.Tensor] = []
+
+    for start in range(0, images.size(0), batch_size):
+        end = min(images.size(0), start + batch_size)
+        x = images[start:end].to(device=device, dtype=torch.float32)
+        x = normalize_batch(x)
+        logits = teacher(x)
+        probs = F.softmax(logits.float(), dim=1)
+        target_probs = probs[torch.arange(probs.size(0), device=probs.device),
+                             labels[start:end].to(device=device)]
+        confidences.append(target_probs.cpu())
+
+    return torch.cat(confidences, dim=0)
+
+
+@torch.no_grad()
+def compute_teacher_per_class_accuracy(
+    teacher: nn.Module,
+    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
+    num_classes: int,
+    device: torch.device,
+    amp_enabled: bool,
+) -> dict[int, float]:
+    """Evaluate teacher on a validation loader and return per‑class accuracy.
+
+    Returns a dict mapping class_id → accuracy in [0, 1].
+    """
+    teacher.eval()
+    correct_per_class = torch.zeros(num_classes, dtype=torch.int64)
+    total_per_class = torch.zeros(num_classes, dtype=torch.int64)
+
+    for images, labels in val_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            logits = teacher(images)
+        preds = logits.argmax(dim=1)
+        for c in range(num_classes):
+            mask = labels == c
+            total_per_class[c] += mask.sum().item()
+            correct_per_class[c] += (preds[mask] == c).sum().item()
+
+    per_class_acc: dict[int, float] = {}
+    for c in range(num_classes):
+        if total_per_class[c] > 0:
+            per_class_acc[c] = float(correct_per_class[c].item()) / float(total_per_class[c].item())
+        else:
+            per_class_acc[c] = 0.0
+    return per_class_acc
+
+
+def compute_adaptive_ipc_allocation(
+    base_ipc: float,
+    per_class_acc: dict[int, float],
+    num_classes: int,
+    beta: float,
+    min_fraction: float,
+    per_class_sample_counts: dict[int, int] | None = None,
+) -> dict[int, int]:
+    """Allocate IPC per class based on teacher per‑class accuracy.
+
+    Hard classes (low teacher accuracy) receive more clusters:
+        ipc_c = base_ipc * (1 + beta * (1 - acc_c))
+    then normalised so that the total budget stays roughly constant and
+    no class gets fewer than min_fraction * base_ipc clusters.
+
+    Returns a dict mapping class_id → target_k (int, >= 1).
+    """
+    beta = float(max(0.0, beta))
+    min_frac = float(np.clip(min_fraction, 0.0, 1.0))
+    min_ipc = max(1.0, base_ipc * min_frac)
+
+    raw_ipc = {}
+    for c in range(num_classes):
+        acc = float(per_class_acc.get(c, 0.5))
+        raw = base_ipc * (1.0 + beta * (1.0 - acc))
+        raw_ipc[c] = raw
+
+    # Normalise to preserve total budget
+    total_raw = sum(raw_ipc.values())
+    if total_raw > 0:
+        scale = (base_ipc * num_classes) / total_raw
+    else:
+        scale = 1.0
+
+    allocation: dict[int, int] = {}
+    for c in range(num_classes):
+        scaled = raw_ipc[c] * scale
+        target = max(1, int(round(scaled)))
+        # Respect per-class sample count if provided
+        if per_class_sample_counts is not None:
+            target = min(target, per_class_sample_counts.get(c, target))
+        allocation[c] = max(1, target)
+
+    return allocation
+
+
 def build_encode_loader(
     train_set: Any,
     image_size: int,
@@ -160,12 +270,19 @@ def compute_classwise_cluster_weights(
         )
 
     mode = str(strategy).strip().lower()
-    if mode not in {"heuristic", "direct", "uniform"}:
+    if mode not in {"heuristic", "direct", "uniform", "inverse"}:
         raise ValueError(f"Unsupported weighting strategy: {strategy}")
 
     labels_l = labels_t.long().view(-1)
     counts_f = counts_t.float().view(-1).clamp_min(0.0)
     weights = torch.zeros_like(counts_f)
+
+    if mode == "inverse":
+        # w_i ∝ 1/c_i, globally normalised so that Σ w_i = 1.
+        # Smaller clusters → larger weight → more attention during student training.
+        inv = 1.0 / counts_f.clamp_min(1.0)
+        total = inv.sum().clamp_min(1e-12)
+        return inv / total
 
     for class_id in range(num_classes):
         mask = labels_l == class_id
@@ -387,11 +504,13 @@ def classwise_random_selection(
     num_classes: int,
     seed: int,
     weighting_strategy: str,
+    per_class_ipc: dict[int, int] | None = None,
 ) -> SelectedSamplesResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
 
     ipc = float(clusters_per_class)
+    per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
     labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
 
     index_chunks: list[torch.Tensor] = []
@@ -405,7 +524,8 @@ def classwise_random_selection(
             warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
             continue
 
-        class_k = target_count_for_class(class_samples, ipc)
+        class_k = per_class.get(class_id, target_count_for_class(class_samples, ipc))
+        class_k = max(1, min(class_k, class_samples))
         class_seed = seed + 1009 * (class_id + 1)
         rng = np.random.default_rng(class_seed)
         picked = np.asarray(rng.choice(class_indices, size=class_k, replace=False), dtype=np.int64)
@@ -440,11 +560,13 @@ def classwise_kmeans_nearest_selection(
     seed: int,
     weighting_strategy: str,
     kmeans_max_iter: int,
+    per_class_ipc: dict[int, int] | None = None,
 ) -> SelectedSamplesResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
 
     ipc = float(clusters_per_class)
+    per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
     kmeans_max_iter = max(10, int(kmeans_max_iter))
     flat_latents = latents.float().cpu().view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
     labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
@@ -460,7 +582,8 @@ def classwise_kmeans_nearest_selection(
             warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
             continue
 
-        class_k = target_count_for_class(class_samples, ipc)
+        class_k = per_class.get(class_id, target_count_for_class(class_samples, ipc))
+        class_k = max(1, min(class_k, class_samples))
         class_seed = seed + 1009 * (class_id + 1)
         class_latents = flat_latents[class_indices]
 
@@ -565,6 +688,7 @@ def classwise_clvq(
     minibatch_size: int,
     medoid_anchor: float,
     weighting_strategy: str,
+    per_class_ipc: dict[int, int] | None = None,
 ) -> CLVQResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
@@ -575,6 +699,7 @@ def classwise_clvq(
     )
 
     ipc = float(clusters_per_class)
+    per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
 
     minibatch_size = max(32, int(minibatch_size))
     max_iter = max(10, int(max_iter))
@@ -597,7 +722,8 @@ def classwise_clvq(
             warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
             continue
 
-        target_k = target_count_for_class(class_samples, ipc)
+        target_k = per_class.get(class_id, target_count_for_class(class_samples, ipc))
+        target_k = max(1, min(target_k, class_samples))
         class_k = target_k
         class_seed = seed + 1009 * (class_id + 1)
         kmeans = MiniBatchKMeans(
@@ -821,6 +947,117 @@ class ReverseSDEDecoder:
             print(f"[Decoding] {end}/{total}")
             yield imgs.float().cpu(), labels[start:end].long().cpu()
 
+    @torch.no_grad()
+    def _decode_best_of_n_batch(
+        self,
+        centers: torch.Tensor,
+        labels: torch.Tensor,
+        teacher: nn.Module,
+        num_candidates: int,
+        teacher_batch_size: int,
+        seed: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Generate *num_candidates* images per center, score with teacher,
+        and return the best candidate per center along with its confidence weight.
+
+        Returns:
+            best_images:  (B, C, H, W)  selected images in [0, 1]
+            best_labels:  (B,)  class labels (same as input labels)
+            conf_weights: (B,)  teacher confidence for the target class
+        """
+        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        start_idx = int((1.0 - self.noise_strength) * (len(timesteps) - 1))
+        start_idx = max(0, min(start_idx, len(timesteps) - 1))
+        start_timestep = timesteps[start_idx]
+
+        B = centers.size(0)
+        N = max(1, int(num_candidates))
+
+        # Expand: (B, C, H, W) → (B*N, C, H, W)
+        centers_expanded = centers.unsqueeze(1).expand(B, N, *centers.shape[1:]).reshape(B * N, *centers.shape[1:])
+        labels_expanded = labels.unsqueeze(1).expand(B, N).reshape(B * N)
+
+        latents = centers_expanded.to(device=self.device, dtype=self.dtype)
+
+        # Independent noise per candidate
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed))
+        noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=self.dtype)
+        latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
+
+        cond_prompt_embeds = self._prompt_embeddings_for_labels(labels_expanded)
+        uncond_prompt_embeds = self._null_prompt_embeddings(latents.size(0)) if self.guidance_scale > 1.0 else None
+
+        for timestep in timesteps[start_idx:]:
+            model_input = self.scheduler.scale_model_input(latents, timestep)
+
+            if uncond_prompt_embeds is not None:
+                model_input = torch.cat([model_input, model_input], dim=0)
+                prompt_embeds = torch.cat([uncond_prompt_embeds, cond_prompt_embeds], dim=0)
+                noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=prompt_embeds).sample
+                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=cond_prompt_embeds).sample
+
+            latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
+
+        images = self.pipe.vae.decode(latents / self.scaling_factor).sample
+        images = (images / 2.0 + 0.5).clamp(0.0, 1.0)
+
+        # Teacher scoring on all B*N candidates (ensure float32 for teacher)
+        confidences = teacher_confidence_scores(
+            teacher=teacher,
+            images=images.float(),
+            labels=labels_expanded,
+            batch_size=teacher_batch_size,
+            device=self.device,
+        )  # (B*N,)
+
+        # Reshape to (B, N) and select best per center
+        confidences_2d = confidences.view(B, N)
+        best_indices = confidences_2d.argmax(dim=1)  # (B,)
+        best_conf = confidences_2d[torch.arange(B, device=best_indices.device), best_indices]  # (B,)
+
+        # Gather best images
+        global_indices = best_indices + torch.arange(B, device=best_indices.device) * N
+        best_images = images[global_indices].float().cpu()
+        best_labels = labels.long().cpu()
+
+        return best_images, best_labels, best_conf.float().cpu()
+
+    @torch.no_grad()
+    def decode_best_of_n(
+        self,
+        centers: torch.Tensor,
+        labels: torch.Tensor,
+        batch_size: int,
+        teacher: nn.Module,
+        num_candidates: int,
+        teacher_batch_size: int,
+        seed: int,
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Iterator version of best‑of‑N decoding.
+
+        Yields (best_images, best_labels, confidence_weights) per batch.
+        """
+        total = centers.size(0)
+        chunk_size = max(1, int(batch_size))
+        for start in range(0, total, chunk_size):
+            end = min(total, start + chunk_size)
+            best_imgs, best_lbls, conf_w = self._decode_best_of_n_batch(
+                centers=centers[start:end],
+                labels=labels[start:end],
+                teacher=teacher,
+                num_candidates=num_candidates,
+                teacher_batch_size=teacher_batch_size,
+                seed=seed + start // chunk_size,
+            )
+            print(f"[Best-of-N Decoding] {end}/{total}")
+            yield best_imgs, best_lbls, conf_w
+
     def cleanup(self) -> None:
         del self.pipe
         if torch.cuda.is_available():
@@ -943,6 +1180,113 @@ class DiTDecoder:
             imgs = self._decode_batch(centers[start:end], labels[start:end])
             print(f"[DiT-Decoding] {end}/{total}")
             yield imgs.float().cpu(), labels[start:end].long().cpu()
+
+    @torch.no_grad()
+    def _decode_best_of_n_batch(
+        self,
+        centers: torch.Tensor,
+        labels: torch.Tensor,
+        teacher: nn.Module,
+        num_candidates: int,
+        teacher_batch_size: int,
+        seed: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """DiT version: generate *num_candidates* images per center, score with teacher,
+        and return the best candidate per center along with its confidence weight.
+
+        Returns:
+            best_images:  (B, C, H, W)  selected images in [0, 1]
+            best_labels:  (B,)  class labels
+            conf_weights: (B,)  teacher confidence for the target class
+        """
+        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
+        timesteps = self.scheduler.timesteps
+
+        start_idx = int((1.0 - self.noise_strength) * (len(timesteps) - 1))
+        start_idx = max(0, min(start_idx, len(timesteps) - 1))
+        start_timestep = timesteps[start_idx]
+
+        B = centers.size(0)
+        N = max(1, int(num_candidates))
+
+        # Expand: (B, C, H, W) → (B*N, C, H, W)
+        centers_expanded = centers.unsqueeze(1).expand(B, N, *centers.shape[1:]).reshape(B * N, *centers.shape[1:])
+        labels_expanded = labels.unsqueeze(1).expand(B, N).reshape(B * N)
+
+        latents = centers_expanded.to(device=self.device, dtype=self.dtype)
+
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(seed))
+        noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=self.dtype)
+        latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
+        class_labels_expanded = labels_expanded.to(device=self.device, dtype=torch.long)
+
+        for timestep in timesteps[start_idx:]:
+            model_input = self.scheduler.scale_model_input(latents, timestep)
+            t_batch = timestep.expand(latents.size(0))
+            noise_pred = self.pipe.transformer(
+                model_input, t_batch, class_labels=class_labels_expanded
+            ).sample
+            if noise_pred.size(1) == 8:
+                noise_pred = noise_pred[:, :4]
+            latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
+
+        images = self.pipe.vae.decode(latents / self.scaling_factor).sample
+        images = (images / 2.0 + 0.5).clamp(0.0, 1.0)
+
+        if images.shape[-1] != self.output_size:
+            images = F.interpolate(images, size=(self.output_size, self.output_size),
+                                   mode="bilinear", align_corners=False)
+
+        # Teacher scoring on all B*N candidates (ensure float32 for teacher)
+        confidences = teacher_confidence_scores(
+            teacher=teacher,
+            images=images.float(),
+            labels=labels_expanded,
+            batch_size=teacher_batch_size,
+            device=self.device,
+        )  # (B*N,)
+
+        # Reshape to (B, N) and select best per center
+        confidences_2d = confidences.view(B, N)
+        best_indices = confidences_2d.argmax(dim=1)
+        best_conf = confidences_2d[torch.arange(B, device=best_indices.device), best_indices]
+
+        global_indices = best_indices + torch.arange(B, device=best_indices.device) * N
+        best_images = images[global_indices].float().cpu()
+        best_labels = labels.long().cpu()
+
+        return best_images, best_labels, best_conf.float().cpu()
+
+    @torch.no_grad()
+    def decode_best_of_n(
+        self,
+        centers: torch.Tensor,
+        labels: torch.Tensor,
+        batch_size: int,
+        teacher: nn.Module,
+        num_candidates: int,
+        teacher_batch_size: int,
+        seed: int,
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """DiT iterator version of best‑of‑N decoding.
+
+        Yields (best_images, best_labels, confidence_weights) per batch.
+        """
+        total = centers.size(0)
+        chunk_size = max(1, int(batch_size))
+        for start in range(0, total, chunk_size):
+            end = min(total, start + chunk_size)
+            best_imgs, best_lbls, conf_w = self._decode_best_of_n_batch(
+                centers=centers[start:end],
+                labels=labels[start:end],
+                teacher=teacher,
+                num_candidates=num_candidates,
+                teacher_batch_size=teacher_batch_size,
+                seed=seed + start // chunk_size,
+            )
+            print(f"[DiT Best-of-N Decoding] {end}/{total}")
+            yield best_imgs, best_lbls, conf_w
 
     def cleanup(self) -> None:
         del self.pipe
@@ -1087,6 +1431,49 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     stream_batch_size = max(1, int(args.save_batch_size))
 
+    # --- Adaptive IPC: compute per‑class teacher accuracy and re‑allocate clusters ---
+    per_class_ipc: dict[int, int] | None = None
+    if bool(args.adaptive_ipc):
+        from .baseline_resnet18 import build_teacher_transforms
+
+        _, eval_transform = build_teacher_transforms(args.image_size, args.teacher_backbone)
+        val_loader_for_acc: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
+            TorchDataset(val_set, transform=eval_transform),
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=False,
+        )
+        per_class_acc = compute_teacher_per_class_accuracy(
+            teacher=teacher,
+            val_loader=val_loader_for_acc,
+            num_classes=num_classes,
+            device=device,
+            amp_enabled=amp_enabled,
+        )
+        # Count per‑class training samples for capping
+        latent_labels_np = latent_labels.long().view(-1).numpy()
+        per_class_samples = {
+            c: int((latent_labels_np == c).sum()) for c in range(num_classes)
+        }
+        per_class_ipc = compute_adaptive_ipc_allocation(
+            base_ipc=args.clusters_per_class,
+            per_class_acc=per_class_acc,
+            num_classes=num_classes,
+            beta=args.adaptive_ipc_beta,
+            min_fraction=args.adaptive_ipc_min_fraction,
+            per_class_sample_counts=per_class_samples,
+        )
+        print(f"[Adaptive IPC] beta={args.adaptive_ipc_beta:.2f} min_frac={args.adaptive_ipc_min_fraction:.2f}")
+        for c in range(num_classes):
+            acc_str = f"{per_class_acc.get(c, 0.0):.3f}"
+            print(f"  class={c} acc={acc_str} ipc={per_class_ipc.get(c, 'N/A')}")
+
+    best_of_n_candidates = max(1, int(args.best_of_n_candidates))
+    best_of_n_enabled = best_of_n_candidates > 1
+    if best_of_n_enabled:
+        print(f"[Best-of-N] enabled with num_candidates={best_of_n_candidates}")
+
     decoder: ReverseSDEDecoder | DiTDecoder | None = None
 
     if args.distill_method == "clvq":
@@ -1101,6 +1488,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             minibatch_size=args.clvq_batch_size,
             medoid_anchor=args.clvq_medoid_anchor,
             weighting_strategy=args.weighting_strategy,
+            per_class_ipc=per_class_ipc,
         )
 
         if is_dit:
@@ -1130,11 +1518,26 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
                 guidance_scale=args.guidance_scale,
             )
 
-        stream_iter = decoder.decode_batches(
-            clvq.centers,
-            clvq.center_labels,
-            batch_size=min(stream_batch_size, max(1, int(args.decode_batch_size))),
-        )
+        decode_bs = min(stream_batch_size, max(1, int(args.decode_batch_size)))
+        if best_of_n_enabled:
+            stream_iter = decoder.decode_best_of_n(
+                clvq.centers,
+                clvq.center_labels,
+                batch_size=decode_bs,
+                teacher=teacher,
+                num_candidates=best_of_n_candidates,
+                teacher_batch_size=args.eval_batch_size,
+                seed=args.seed + 9001,
+            )
+            # For Best‑of‑N, the stream yields (images, labels, confidence_weights)
+            best_of_n_stream = True
+        else:
+            stream_iter = decoder.decode_batches(
+                clvq.centers,
+                clvq.center_labels,
+                batch_size=decode_bs,
+            )
+            best_of_n_stream = False
 
         distilled_labels = clvq.center_labels
         distilled_counts = clvq.counts
@@ -1146,6 +1549,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             num_classes=num_classes,
             seed=args.seed,
             weighting_strategy=args.weighting_strategy,
+            per_class_ipc=per_class_ipc,
         )
         expected_labels = selected.labels.long().cpu()
         stream_iter = iter_images_by_indices(
@@ -1157,6 +1561,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_labels = expected_labels
         distilled_counts = selected.counts
         distilled_weights = selected.weights
+        best_of_n_stream = False
     elif args.distill_method == "kmeans":
         selected = classwise_kmeans_nearest_selection(
             latents=latents,
@@ -1166,6 +1571,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             seed=args.seed,
             weighting_strategy=args.weighting_strategy,
             kmeans_max_iter=args.kmeans_max_iter,
+            per_class_ipc=per_class_ipc,
         )
         expected_labels = selected.labels.long().cpu()
         stream_iter = iter_images_by_indices(
@@ -1177,6 +1583,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_labels = expected_labels
         distilled_counts = selected.counts
         distilled_weights = selected.weights
+        best_of_n_stream = False
     else:
         raise ValueError(f"Unsupported distill method: {args.distill_method}")
 
@@ -1192,7 +1599,14 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     shard_root.mkdir(parents=True, exist_ok=True)
 
     try:
-        for batch_idx, (image_batch, label_batch) in enumerate(stream_iter, start=1):
+        for batch_idx, stream_item in enumerate(stream_iter, start=1):
+            if best_of_n_stream:
+                image_batch, label_batch, conf_weights = stream_item
+                conf_weights = conf_weights.float().cpu()
+            else:
+                image_batch, label_batch = stream_item
+                conf_weights = None
+
             image_batch = image_batch.float().cpu()
             label_batch = label_batch.long().cpu()
             batch_n = int(image_batch.size(0))
@@ -1215,6 +1629,14 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             )
             soft_label_chunks.append(soft_batch)
 
+            # Merge Best‑of‑N confidence weights with cluster weights
+            batch_weights = distilled_weights[cursor : cursor + batch_n].float().cpu()
+            if conf_weights is not None:
+                batch_weights = batch_weights * conf_weights.clamp_min(0.0)
+                batch_weights = batch_weights / batch_weights.mean().clamp_min(1e-12)
+                # Update the global weights tensor in‑place so downstream serialisation picks up merged weights
+                distilled_weights[cursor : cursor + batch_n] = batch_weights
+
             rel_paths = save_distilled_images(
                 images=image_batch,
                 labels=label_batch,
@@ -1230,7 +1652,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
                 {
                     "images": (image_batch * 255.0).clamp(0.0, 255.0).to(torch.uint8),
                     "labels": label_batch,
-                    "weights": distilled_weights[cursor : cursor + batch_n].float().cpu(),
+                    "weights": batch_weights.float().cpu(),
                     "soft_labels": soft_batch.float().cpu(),
                     "start_index": int(cursor),
                     "end_index": int(cursor + batch_n),
@@ -1320,6 +1742,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         store_images_in_pt=bool(args.store_images_in_pt),
         fkd_batch_path=fkd_batch_path,
         fkd_batch_summary=fkd_batch_summary,
+        distill_method=str(args.distill_method),
     )
 
     del vae
@@ -1351,6 +1774,10 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "lora_path": resolved_lora_path,
         "latent_cache_path": str(latent_cache_path),
         "latent_source": latent_source,
+        "best_of_n_candidates": int(args.best_of_n_candidates),
+        "adaptive_ipc": bool(args.adaptive_ipc),
+        "adaptive_ipc_beta": float(args.adaptive_ipc_beta) if args.adaptive_ipc else 0.0,
+        "adaptive_ipc_min_fraction": float(args.adaptive_ipc_min_fraction) if args.adaptive_ipc else 0.0,
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -1384,7 +1811,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--weighting-strategy",
         type=str,
         default="heuristic",
-        choices=["heuristic", "direct", "uniform"],
+        choices=["heuristic", "direct", "uniform", "inverse"],
     )
 
     parser.add_argument("--encode-batch-size", type=int, default=64)
@@ -1408,6 +1835,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--sde-steps", type=int, default=200)
     parser.add_argument("--sde-noise-strength", type=float, default=0.2)
+
+    # --- Best‑of‑N teacher‑guided decoding ---
+    parser.add_argument(
+        "--best-of-n-candidates", type=int, default=1,
+        help="Number of candidate images to generate per cluster center. "
+             "If > 1, teacher selects the best candidate. (default: 1 = off)",
+    )
+    parser.add_argument(
+        "--best-of-n-confidence-threshold", type=float, default=0.0,
+        help="Minimum teacher confidence to keep a distilled sample "
+             "(0 = keep all). Only used when best-of-n-candidates > 1.",
+    )
+
+    # --- Adaptive IPC ---
+    parser.add_argument(
+        "--adaptive-ipc", action=argparse.BooleanOptionalAction, default=False,
+        help="Allocate more clusters to hard classes based on teacher per‑class accuracy.",
+    )
+    parser.add_argument(
+        "--adaptive-ipc-beta", type=float, default=0.5,
+        help="Strength of adaptive IPC re‑allocation. "
+             "ipc_c = base * (1 + beta * (1 - acc_c)). (default: 0.5)",
+    )
+    parser.add_argument(
+        "--adaptive-ipc-min-fraction", type=float, default=0.5,
+        help="Minimum fraction of base IPC that any class can receive. (default: 0.5)",
+    )
 
     parser.add_argument("--teacher-backbone", type=str, default="resnet18", choices=["resnet18", "resnet50"])
     parser.add_argument("--teacher-epochs", type=int, default=20)

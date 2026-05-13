@@ -46,13 +46,13 @@ uv run run-train-lora-sd \
   --output-dir "$OUTPUT_DIR" \
   "${MODEL_ARGS[@]}" \
   --resolution 224 \
-  --batch-size 4 \
+  --batch-size 16 \
   --gradient-accumulation-steps 2 \
-  --epochs 20 \
-  --max-train-steps 3000 \
+  --epochs 5 \
+#   --max-train-steps 3000 \
   --rank 16 \
   --lora-alpha 16 \
-  --lr 5e-5 \
+  --lr 3e-4 \
   --lr-schedule cosine \
   --lr-warmup-steps 100 \
   --class-balance \

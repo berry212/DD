@@ -206,6 +206,7 @@ def save_distillation_artifacts(
     store_images_in_pt: bool = True,
     fkd_batch_path: str = "",
     fkd_batch_summary: dict[str, object] | None = None,
+    distill_method: str = "clvq",
 ) -> None:
     payload: dict[str, object] = {
         "weights": weights.float().cpu(),
@@ -214,6 +215,7 @@ def save_distillation_artifacts(
         "lora_path": lora_path,
         "teacher_temperature": float(teacher_temperature),
         "image_relative_paths": list(saved_paths),
+        "distill_method": str(distill_method),
     }
     if image_shards:
         payload["image_shards"] = list(image_shards)
@@ -235,6 +237,7 @@ def save_distillation_artifacts(
         "lora_path": lora_path,
         "teacher_temperature": float(teacher_temperature),
         "num_distilled": num_distilled,
+        "distill_method": str(distill_method),
         "weights_sum": float(weights.sum().item()),
         "soft_labels_shape": list(soft_labels.shape),
         "center_labels": [int(v) for v in center_labels.tolist()],

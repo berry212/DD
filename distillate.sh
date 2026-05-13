@@ -3,9 +3,6 @@ set -euo pipefail
 
 DATASET="${DATASET:-dermamnist}"
 DATASET="$(echo "$DATASET" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-if [[ "$DATASET" == "odir5k" ]]; then
-  DATASET="odir-5k"
-fi
 if [[ "$DATASET" == "aptos" || "$DATASET" == "aptos2019" || "$DATASET" == "aptos-2019" ]]; then
   DATASET="aptos-2019-blindness-detection"
 fi
@@ -24,8 +21,12 @@ GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.0}"
 SDE_STEPS="${SDE_STEPS:-200}"
 SDE_NOISE_STRENGTH="${SDE_NOISE_STRENGTH:-0.2}"
 CLVQ_MEDOID_ANCHOR="${CLVQ_MEDOID_ANCHOR:-0.0}"
-WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-heuristic}"
+WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-inverse}"
 MODEL_TYPE="${MODEL_TYPE:-sd}"
+BEST_OF_N_CANDIDATES="${BEST_OF_N_CANDIDATES:-1}"
+ADAPTIVE_IPC="${ADAPTIVE_IPC:-false}"
+ADAPTIVE_IPC_BETA="${ADAPTIVE_IPC_BETA:-0.5}"
+ADAPTIVE_IPC_MIN_FRACTION="${ADAPTIVE_IPC_MIN_FRACTION:-0.5}"
 
 if [[ "$MODEL_TYPE" == "dit" ]]; then
   DIFFUSION_MODEL_ID="facebook/DiT-XL-2-256"
@@ -35,8 +36,8 @@ else
   MODEL_ARGS=()
 fi
 
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-300}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-50}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 TRAIN_CROP_MIN_SCALE="${TRAIN_CROP_MIN_SCALE:-0.08}"
 TRAIN_CROP_MAX_SCALE="${TRAIN_CROP_MAX_SCALE:-1.0}"
 TRAIN_HFLIP_PROB="${TRAIN_HFLIP_PROB:-0.5}"
@@ -92,6 +93,11 @@ if [[ "$FKD_PRECOMPUTE_BATCHES" == "false" ]]; then
   FKD_PRECOMPUTE_FLAG="--no-fkd-precompute-batches"
 fi
 
+ADAPTIVE_IPC_FLAGS=()
+if [[ "$ADAPTIVE_IPC" == "true" ]]; then
+  ADAPTIVE_IPC_FLAGS=(--adaptive-ipc --adaptive-ipc-beta "$ADAPTIVE_IPC_BETA" --adaptive-ipc-min-fraction "$ADAPTIVE_IPC_MIN_FRACTION")
+fi
+
 uv run run-distillation \
   --dataset "$DATASET" \
   --data-root "$DATA_ROOT" \
@@ -116,8 +122,10 @@ uv run run-distillation \
   --no-auto-train-teacher-baseline \
   --sde-steps "$SDE_STEPS" \
   --sde-noise-strength "$SDE_NOISE_STRENGTH" \
+  --best-of-n-candidates "$BEST_OF_N_CANDIDATES" \
+  "${ADAPTIVE_IPC_FLAGS[@]}" \
   --encode-batch-size 32 \
-  --decode-batch-size 4 \
+  --decode-batch-size 32 \
   "$FKD_PRECOMPUTE_FLAG" \
   --fkd-train-epochs "$TRAIN_EPOCHS" \
   --fkd-batch-size "$TRAIN_BATCH_SIZE" \
