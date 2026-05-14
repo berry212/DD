@@ -263,6 +263,7 @@ def compute_classwise_cluster_weights(
     labels_t: torch.Tensor,
     num_classes: int,
     strategy: str,
+    weight_smooth: float = 0.0,
 ) -> torch.Tensor:
     if counts_t.numel() != labels_t.numel():
         raise ValueError(
@@ -273,6 +274,7 @@ def compute_classwise_cluster_weights(
     if mode not in {"heuristic", "direct", "uniform", "inverse"}:
         raise ValueError(f"Unsupported weighting strategy: {strategy}")
 
+    smooth = float(max(0.0, min(1.0, weight_smooth)))
     labels_l = labels_t.long().view(-1)
     counts_f = counts_t.float().view(-1).clamp_min(0.0)
     weights = torch.zeros_like(counts_f)
@@ -289,6 +291,8 @@ def compute_classwise_cluster_weights(
             inv_c = 1.0 / class_counts
             total_c = inv_c.sum().clamp_min(1e-12)
             weights[mask] = inv_c / total_c
+            if smooth > 0.0:
+                weights[mask] = weights[mask].pow(smooth)
         return weights
 
     for class_id in range(num_classes):
@@ -309,6 +313,9 @@ def compute_classwise_cluster_weights(
         else:
             # DDOQ Appendix H Eq.(34): w_k^(L) = K_L * v_k^(L) / sum_j v_j^(L).
             weights[mask] = float(class_k) * class_counts / class_mass
+
+        if smooth > 0.0 and mode in {"heuristic", "inverse"}:
+            weights[mask] = weights[mask].pow(smooth)
 
     return weights
 
@@ -511,6 +518,7 @@ def classwise_random_selection(
     num_classes: int,
     seed: int,
     weighting_strategy: str,
+    weight_smooth: float = 0.0,
     per_class_ipc: dict[int, int] | None = None,
 ) -> SelectedSamplesResult:
     if clusters_per_class <= 0:
@@ -554,6 +562,7 @@ def classwise_random_selection(
         labels_t=labels_t,
         num_classes=num_classes,
         strategy=weighting_strategy,
+        weight_smooth=weight_smooth,
     )
 
     return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
@@ -567,6 +576,7 @@ def classwise_kmeans_nearest_selection(
     seed: int,
     weighting_strategy: str,
     kmeans_max_iter: int,
+    weight_smooth: float = 0.0,
     per_class_ipc: dict[int, int] | None = None,
 ) -> SelectedSamplesResult:
     if clusters_per_class <= 0:
@@ -620,6 +630,7 @@ def classwise_kmeans_nearest_selection(
         labels_t=labels_t,
         num_classes=num_classes,
         strategy=weighting_strategy,
+        weight_smooth=weight_smooth,
     )
 
     return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
@@ -697,6 +708,7 @@ def classwise_clvq(
     weighting_strategy: str,
     per_class_ipc: dict[int, int] | None = None,
     kmeans_max_iter: int = 300,
+    weight_smooth: float = 0.0,
 ) -> CLVQResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
@@ -809,6 +821,7 @@ def classwise_clvq(
         labels_t=labels_t,
         num_classes=num_classes,
         strategy=weighting_strategy,
+        weight_smooth=weight_smooth,
     )
 
     return CLVQResult(
@@ -1522,6 +1535,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             weighting_strategy=args.weighting_strategy,
             per_class_ipc=per_class_ipc,
             kmeans_max_iter=args.kmeans_max_iter,
+            weight_smooth=args.weight_smooth,
         )
 
         if is_dit:
@@ -1582,6 +1596,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             num_classes=num_classes,
             seed=args.seed,
             weighting_strategy=args.weighting_strategy,
+            weight_smooth=args.weight_smooth,
             per_class_ipc=per_class_ipc,
         )
         expected_labels = selected.labels.long().cpu()
@@ -1604,6 +1619,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             seed=args.seed,
             weighting_strategy=args.weighting_strategy,
             kmeans_max_iter=args.kmeans_max_iter,
+            weight_smooth=args.weight_smooth,
             per_class_ipc=per_class_ipc,
         )
         expected_labels = selected.labels.long().cpu()
@@ -1845,6 +1861,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="heuristic",
         choices=["heuristic", "direct", "uniform", "inverse"],
+    )
+    parser.add_argument(
+        "--weight-smooth", type=float, default=0.5,
+        help="Apply pow(smooth) to heuristic/inverse weights to prevent extreme values. "
+             "0.5 = sqrt (recommended), 0.0 = no smoothing. Only affects heuristic and inverse.",
     )
 
     parser.add_argument("--encode-batch-size", type=int, default=64)

@@ -49,7 +49,7 @@ uv run run-train-lora-sd \
   --batch-size 16 \
   --gradient-accumulation-steps 2 \
   --epochs 5 \
-#   --max-train-steps 3000 \
+  --max-train-steps 300000 \
   --rank 16 \
   --lora-alpha 16 \
   --lr 3e-4 \

@@ -27,6 +27,7 @@ BEST_OF_N_CANDIDATES="${BEST_OF_N_CANDIDATES:-1}"
 ADAPTIVE_IPC="${ADAPTIVE_IPC:-false}"
 ADAPTIVE_IPC_BETA="${ADAPTIVE_IPC_BETA:-0.5}"
 ADAPTIVE_IPC_MIN_FRACTION="${ADAPTIVE_IPC_MIN_FRACTION:-0.5}"
+WEIGHT_SMOOTH="${WEIGHT_SMOOTH:-0.5}"
 
 if [[ "$MODEL_TYPE" == "dit" ]]; then
   DIFFUSION_MODEL_ID="facebook/DiT-XL-2-256"
@@ -116,6 +117,7 @@ uv run run-distillation \
   --clvq-batch-size "$CLVQ_BATCH_SIZE" \
   --clvq-medoid-anchor "$CLVQ_MEDOID_ANCHOR" \
   --weighting-strategy "$WEIGHTING_STRATEGY" \
+  --weight-smooth "$WEIGHT_SMOOTH" \
   --teacher-backbone "$TEACHER_BACKBONE" \
   --teacher-epochs "$TEACHER_EPOCHS" \
   --teacher-temperature "$TEACHER_TEMPERATURE" \
