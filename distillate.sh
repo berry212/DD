@@ -28,6 +28,8 @@ ADAPTIVE_IPC="${ADAPTIVE_IPC:-false}"
 ADAPTIVE_IPC_BETA="${ADAPTIVE_IPC_BETA:-0.5}"
 ADAPTIVE_IPC_MIN_FRACTION="${ADAPTIVE_IPC_MIN_FRACTION:-0.5}"
 WEIGHT_SMOOTH="${WEIGHT_SMOOTH:-0.5}"
+MODE_GUIDANCE_LAMBDA="${MODE_GUIDANCE_LAMBDA:-0.1}"
+MODE_GUIDANCE_T_STOP="${MODE_GUIDANCE_T_STOP:-80}"
 
 if [[ "$MODEL_TYPE" == "dit" ]]; then
   DIFFUSION_MODEL_ID="facebook/DiT-XL-2-256"
@@ -125,6 +127,8 @@ uv run run-distillation \
   --sde-steps "$SDE_STEPS" \
   --sde-noise-strength "$SDE_NOISE_STRENGTH" \
   --best-of-n-candidates "$BEST_OF_N_CANDIDATES" \
+  --mode-guidance-lambda "$MODE_GUIDANCE_LAMBDA" \
+  --mode-guidance-t-stop "$MODE_GUIDANCE_T_STOP" \
   "${ADAPTIVE_IPC_FLAGS[@]}" \
   --encode-batch-size 32 \
   --decode-batch-size 32 \

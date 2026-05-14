@@ -845,6 +845,8 @@ class ReverseSDEDecoder:
         lora_scale: float,
         class_prompts: dict[int, str],
         guidance_scale: float,
+        mode_guidance_lambda: float = 0.0,
+        mode_guidance_t_stop: int = 0,
     ) -> None:
         self.device = device
         self.dtype = dtype
@@ -853,6 +855,8 @@ class ReverseSDEDecoder:
         self.class_prompts = dict(class_prompts)
         self.guidance_scale = float(max(0.0, guidance_scale))
         self._default_prompt = next(iter(self.class_prompts.values()), "medical image")
+        self.mg_lambda = float(max(0.0, mode_guidance_lambda))
+        self.mg_t_stop = max(0, int(mode_guidance_t_stop))
 
         kwargs: dict[str, Any] = {
             "torch_dtype": dtype,
@@ -949,7 +953,11 @@ class ReverseSDEDecoder:
         cond_prompt_embeds = self._prompt_embeddings_for_labels(labels)
         uncond_prompt_embeds = self._null_prompt_embeddings(latents.size(0)) if self.guidance_scale > 1.0 else None
 
-        for timestep in timesteps[start_idx:]:
+        # ── Preload alphas_cumprod for MGD³ x0‑prediction ──
+        alphas_cp = self.scheduler.alphas_cumprod.to(device=self.device, dtype=self.dtype)
+
+        for step_i, timestep in enumerate(timesteps[start_idx:]):
+            t_val = timestep.expand(latents.size(0))
             model_input = self.scheduler.scale_model_input(latents, timestep)
 
             if uncond_prompt_embeds is not None:
@@ -960,6 +968,20 @@ class ReverseSDEDecoder:
                 noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=cond_prompt_embeds).sample
+
+            # ── MGD³ Mode Guidance (Eq. 5‑6) ──
+            # g_t = m_target - x0_pred
+            # ε̂_t = ε_t + λ · g_t · σ_t
+            if self.mg_lambda > 0.0 and int(timestep.item()) > self.mg_t_stop:
+                alpha_bar_t = alphas_cp[timestep]  # scalar → broadcasts
+                # x0_pred = (x_t − √(1−ᾱ_t)·ε_t) / √ᾱ_t   (Eq.5)
+                sqrt_alpha_bar = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar_t)
+                x0_pred = (latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar
+                # guidance signal: pull toward the original cluster center
+                g_t = centers.to(device=self.device, dtype=self.dtype) - x0_pred
+                noise_pred = noise_pred + self.mg_lambda * g_t * sqrt_one_minus_alpha_bar
+                # ── end MGD³ ──
 
             latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
 
@@ -1035,7 +1057,12 @@ class ReverseSDEDecoder:
         cond_prompt_embeds = self._prompt_embeddings_for_labels(labels_expanded)
         uncond_prompt_embeds = self._null_prompt_embeddings(latents.size(0)) if self.guidance_scale > 1.0 else None
 
-        for timestep in timesteps[start_idx:]:
+        # ── Preload alphas_cumprod for MGD³ x0‑prediction ──
+        alphas_cp = self.scheduler.alphas_cumprod.to(device=self.device, dtype=self.dtype)
+        # mode target for each candidate is the original (un‑expanded) center
+        mode_target = centers.to(device=self.device, dtype=self.dtype)
+
+        for step_i, timestep in enumerate(timesteps[start_idx:]):
             model_input = self.scheduler.scale_model_input(latents, timestep)
 
             if uncond_prompt_embeds is not None:
@@ -1046,6 +1073,18 @@ class ReverseSDEDecoder:
                 noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=cond_prompt_embeds).sample
+
+            # ── MGD³ Mode Guidance ──
+            if self.mg_lambda > 0.0 and int(timestep.item()) > self.mg_t_stop:
+                alpha_bar_t = alphas_cp[timestep]
+                sqrt_alpha_bar = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar_t)
+                x0_pred = (latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar
+                # expand mode_target to match B*N
+                m_target = mode_target.unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(B * N, *mode_target.shape[1:])
+                g_t = m_target - x0_pred
+                noise_pred = noise_pred + self.mg_lambda * g_t * sqrt_one_minus_alpha_bar
+                # ── end MGD³ ──
 
             latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
 
@@ -1123,6 +1162,8 @@ class DiTDecoder:
         lora_path: str,
         lora_scale: float,
         output_size: int = 224,
+        mode_guidance_lambda: float = 0.0,
+        mode_guidance_t_stop: int = 0,
     ) -> None:
         self.device = device
         self.dtype = dtype
@@ -1130,6 +1171,8 @@ class DiTDecoder:
         self.noise_strength = float(np.clip(noise_strength, 0.01, 1.0))
         self.output_size = int(output_size)
         self.scaling_factor = float(getattr(vae.config, "scaling_factor", 0.18215))
+        self.mg_lambda = float(max(0.0, mode_guidance_lambda))
+        self.mg_t_stop = max(0, int(mode_guidance_t_stop))
 
         kwargs: dict[str, Any] = {
             "torch_dtype": dtype,
@@ -1179,7 +1222,11 @@ class DiTDecoder:
         latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
         class_labels = labels.to(device=self.device, dtype=torch.long)
 
-        for timestep in timesteps[start_idx:]:
+        # ── Preload alphas_cumprod for MGD³ x0‑prediction ──
+        alphas_cp = self.scheduler.alphas_cumprod.to(device=self.device, dtype=self.dtype)
+        mode_target = centers.to(device=self.device, dtype=self.dtype)
+
+        for step_i, timestep in enumerate(timesteps[start_idx:]):
             model_input = self.scheduler.scale_model_input(latents, timestep)
             # DiT requires 1D timestep tensor; DDIM scheduler gives scalar
             t_batch = timestep.expand(latents.size(0))
@@ -1189,6 +1236,17 @@ class DiTDecoder:
             # DiT outputs 8 channels (noise+variance), use only first 4
             if noise_pred.size(1) == 8:
                 noise_pred = noise_pred[:, :4]
+
+            # ── MGD³ Mode Guidance ──
+            if self.mg_lambda > 0.0 and int(timestep.item()) > self.mg_t_stop:
+                alpha_bar_t = alphas_cp[timestep]
+                sqrt_alpha_bar = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar_t)
+                x0_pred = (latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar
+                g_t = mode_target - x0_pred
+                noise_pred = noise_pred + self.mg_lambda * g_t * sqrt_one_minus_alpha_bar
+                # ── end MGD³ ──
+
             latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
 
         images = self.pipe.vae.decode(latents / self.scaling_factor).sample
@@ -1266,7 +1324,11 @@ class DiTDecoder:
         latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
         class_labels_expanded = labels_expanded.to(device=self.device, dtype=torch.long)
 
-        for timestep in timesteps[start_idx:]:
+        # ── Preload alphas_cumprod for MGD³ x0‑prediction ──
+        alphas_cp = self.scheduler.alphas_cumprod.to(device=self.device, dtype=self.dtype)
+        mode_target = centers.to(device=self.device, dtype=self.dtype)
+
+        for step_i, timestep in enumerate(timesteps[start_idx:]):
             model_input = self.scheduler.scale_model_input(latents, timestep)
             t_batch = timestep.expand(latents.size(0))
             noise_pred = self.pipe.transformer(
@@ -1274,6 +1336,18 @@ class DiTDecoder:
             ).sample
             if noise_pred.size(1) == 8:
                 noise_pred = noise_pred[:, :4]
+
+            # ── MGD³ Mode Guidance ──
+            if self.mg_lambda > 0.0 and int(timestep.item()) > self.mg_t_stop:
+                alpha_bar_t = alphas_cp[timestep]
+                sqrt_alpha_bar = torch.sqrt(alpha_bar_t)
+                sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar_t)
+                x0_pred = (latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar
+                m_target = mode_target.unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(B * N, *mode_target.shape[1:])
+                g_t = m_target - x0_pred
+                noise_pred = noise_pred + self.mg_lambda * g_t * sqrt_one_minus_alpha_bar
+                # ── end MGD³ ──
+
             latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
 
         images = self.pipe.vae.decode(latents / self.scaling_factor).sample
@@ -1518,6 +1592,11 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     best_of_n_enabled = best_of_n_candidates > 1
     if best_of_n_enabled:
         print(f"[Best-of-N] enabled with num_candidates={best_of_n_candidates}")
+    if args.mode_guidance_lambda > 0.0:
+        print(
+            f"[MGD³] mode guidance enabled: λ={args.mode_guidance_lambda:.3f} "
+            f"t_stop={args.mode_guidance_t_stop}"
+        )
 
     decoder: ReverseSDEDecoder | DiTDecoder | None = None
 
@@ -1549,6 +1628,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
                 lora_path=resolved_lora_path,
                 lora_scale=args.lora_scale,
                 output_size=args.image_size,
+                mode_guidance_lambda=args.mode_guidance_lambda,
+                mode_guidance_t_stop=args.mode_guidance_t_stop,
             )
         else:
             class_prompts = dataset_spec.build_class_prompts()
@@ -1563,6 +1644,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
                 lora_scale=args.lora_scale,
                 class_prompts=class_prompts,
                 guidance_scale=args.guidance_scale,
+                mode_guidance_lambda=args.mode_guidance_lambda,
+                mode_guidance_t_stop=args.mode_guidance_t_stop,
             )
 
         decode_bs = min(stream_batch_size, max(1, int(args.decode_batch_size)))
@@ -1824,6 +1907,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "latent_cache_path": str(latent_cache_path),
         "latent_source": latent_source,
         "best_of_n_candidates": int(args.best_of_n_candidates),
+        "mode_guidance_lambda": float(args.mode_guidance_lambda),
+        "mode_guidance_t_stop": int(args.mode_guidance_t_stop),
         "adaptive_ipc": bool(args.adaptive_ipc),
         "adaptive_ipc_beta": float(args.adaptive_ipc_beta) if args.adaptive_ipc else 0.0,
         "adaptive_ipc_min_fraction": float(args.adaptive_ipc_min_fraction) if args.adaptive_ipc else 0.0,
@@ -1889,6 +1974,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance-scale", type=float, default=3.0)
     parser.add_argument("--sde-steps", type=int, default=200)
     parser.add_argument("--sde-noise-strength", type=float, default=0.2)
+    parser.add_argument(
+        "--mode-guidance-lambda", type=float, default=0.0,
+        help="MGD³ mode guidance strength. 0 = off, typical 0.05‑0.2.",
+    )
+    parser.add_argument(
+        "--mode-guidance-t-stop", type=int, default=25,
+        help="Stop mode guidance when timestep <= this value. "
+             "Higher = stop earlier. 0 = never stop.",
+    )
 
     # --- Best‑of‑N teacher‑guided decoding ---
     parser.add_argument(
