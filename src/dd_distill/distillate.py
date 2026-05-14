@@ -278,11 +278,18 @@ def compute_classwise_cluster_weights(
     weights = torch.zeros_like(counts_f)
 
     if mode == "inverse":
-        # w_i ∝ 1/c_i, globally normalised so that Σ w_i = 1.
+        # Per‑class inverse: w_i ∝ 1/c_i, normalised within each class.
         # Smaller clusters → larger weight → more attention during student training.
-        inv = 1.0 / counts_f.clamp_min(1.0)
-        total = inv.sum().clamp_min(1e-12)
-        return inv / total
+        for class_id in range(num_classes):
+            mask = labels_l == class_id
+            class_k = int(mask.sum().item())
+            if class_k <= 0:
+                continue
+            class_counts = counts_f[mask].clamp_min(1.0)
+            inv_c = 1.0 / class_counts
+            total_c = inv_c.sum().clamp_min(1e-12)
+            weights[mask] = inv_c / total_c
+        return weights
 
     for class_id in range(num_classes):
         mask = labels_l == class_id
@@ -689,13 +696,14 @@ def classwise_clvq(
     medoid_anchor: float,
     weighting_strategy: str,
     per_class_ipc: dict[int, int] | None = None,
+    kmeans_max_iter: int = 300,
 ) -> CLVQResult:
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
 
     print(
-        "[CLVQ] Using the paper-aligned class-wise clustering path implemented with "
-        "MiniBatchKMeans in latent space."
+        "[CLVQ] Using class-wise clustering (MiniBatchKMeans for large classes, "
+        "standard KMeans for tight ratio classes)."
     )
 
     ipc = float(clusters_per_class)
@@ -726,17 +734,42 @@ def classwise_clvq(
         target_k = max(1, min(target_k, class_samples))
         class_k = target_k
         class_seed = seed + 1009 * (class_id + 1)
-        kmeans = MiniBatchKMeans(
-            n_clusters=class_k,
-            random_state=class_seed,
-            batch_size=minibatch_size,
-            max_iter=max_iter,
-            n_init=3,
-            tol=float(max(tol, 1e-8)),
-            reassignment_ratio=0.01,
-        )
-        assignments = kmeans.fit_predict(class_latents)
-        centers = kmeans.cluster_centers_.astype(np.float32, copy=False)
+
+        # ── Tiered clustering: no‑op / MiniBatchKMeans / KMeans fallback ──
+        if class_samples <= target_k:
+            # Not enough samples — use all latent vectors directly as centers.
+            centers = class_latents.astype(np.float32, copy=True)
+            counts = np.ones(class_samples, dtype=np.int64)
+            backend_label = "NoCluster"
+        else:
+            # Try MiniBatchKMeans first; fall back to standard KMeans if empty clusters appear.
+            kmeans_mb = MiniBatchKMeans(
+                n_clusters=class_k,
+                random_state=class_seed,
+                batch_size=minibatch_size,
+                max_iter=max_iter,
+                n_init=3,
+                tol=float(max(tol, 1e-8)),
+                reassignment_ratio=0.01,
+            )
+            assignments = kmeans_mb.fit_predict(class_latents)
+            centers = kmeans_mb.cluster_centers_.astype(np.float32, copy=False)
+            counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
+
+            if int((counts == 0).sum()) > 0:
+                # Empty clusters detected → retry with standard KMeans.
+                kmeans_full = KMeans(
+                    n_clusters=class_k,
+                    random_state=class_seed,
+                    n_init=10,
+                    max_iter=max(300, int(kmeans_max_iter)),
+                )
+                assignments = kmeans_full.fit_predict(class_latents)
+                centers = kmeans_full.cluster_centers_.astype(np.float32, copy=False)
+                counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
+                backend_label = "KMeans(retry)"
+            else:
+                backend_label = "MiniBatchKMeans"
 
         if medoid_anchor > 0.0:
             centers = anchor_centers_to_medoids(
@@ -746,8 +779,7 @@ def classwise_clvq(
                 batch_size=2048,
             )
             assignments = assign_to_centers(class_latents, centers, batch_size=2048)
-
-        counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
+            counts = np.bincount(assignments, minlength=centers.shape[0]).astype(np.int64)
 
         non_empty_mask = counts > 0
         centers = centers[non_empty_mask]
@@ -761,7 +793,7 @@ def classwise_clvq(
         count_chunks.append(torch.from_numpy(counts))
 
         print(
-            f"[CLVQ/MiniBatchKMeans-Class] class={class_id} samples={class_samples} "
+            f"[CLVQ/{backend_label}-Class] class={class_id} samples={class_samples} "
             f"target_k={target_k} used={class_k} kept={centers.shape[0]} "
             f"batch_size={minibatch_size} max_iter={max_iter} medoid_anchor={medoid_anchor:.2f}"
         )
@@ -1489,6 +1521,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             medoid_anchor=args.clvq_medoid_anchor,
             weighting_strategy=args.weighting_strategy,
             per_class_ipc=per_class_ipc,
+            kmeans_max_iter=args.kmeans_max_iter,
         )
 
         if is_dit:
