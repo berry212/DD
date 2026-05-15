@@ -53,7 +53,6 @@ uv run run-train-distilled-student \
   --train-lr "$TRAIN_LR" \
   --weight-decay 1e-4 \
   --kd-temperature "$KD_TEMPERATURE" \
-  --hard-label-alpha 0.0 \
   --weight-balance-alpha 0.0 \
   --soft-label-sharpen 1.0 \
   --train-crop-min-scale "$TRAIN_CROP_MIN_SCALE" \
@@ -63,3 +62,5 @@ uv run run-train-distilled-student \
   --amp \
   --num-workers 4 \
   "$@"
+
+#   --hard-label-alpha 0.0 \

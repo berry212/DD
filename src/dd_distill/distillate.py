@@ -258,7 +258,7 @@ def target_count_for_class(class_samples: int, ipc: float) -> int:
     return max(1, min(target_k, class_samples))
 
 
-def compute_classwise_cluster_weights(
+def compute_cluster_weights(
     counts_t: torch.Tensor,
     labels_t: torch.Tensor,
     num_classes: int,
@@ -512,7 +512,7 @@ def nearest_samples_to_centers_unique(data: np.ndarray, centers: np.ndarray) -> 
     return np.asarray(chosen, dtype=np.int64)
 
 
-def classwise_random_selection(
+def global_random_selection(
     labels: torch.Tensor,
     clusters_per_class: float,
     num_classes: int,
@@ -521,43 +521,36 @@ def classwise_random_selection(
     weight_smooth: float = 0.0,
     per_class_ipc: dict[int, int] | None = None,
 ) -> SelectedSamplesResult:
+    """Global random selection across all classes (no longer per-class)."""
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
 
-    ipc = float(clusters_per_class)
     per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
     labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
+    n_total = int(labels_np.shape[0])
 
-    index_chunks: list[torch.Tensor] = []
-    label_chunks: list[torch.Tensor] = []
-    count_chunks: list[torch.Tensor] = []
+    # Compute total selection budget
+    if per_class:
+        total_k = sum(per_class.values())
+    else:
+        total_k = int(clusters_per_class * num_classes)
+    total_k = max(1, min(total_k, n_total))
 
-    for class_id in range(num_classes):
-        class_indices = np.flatnonzero(labels_np == class_id)
-        class_samples = int(class_indices.shape[0])
-        if class_samples == 0:
-            warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
-            continue
+    rng = np.random.default_rng(seed)
+    picked = np.asarray(rng.choice(n_total, size=total_k, replace=False), dtype=np.int64)
+    picked_labels = labels_np[picked]
 
-        class_k = per_class.get(class_id, target_count_for_class(class_samples, ipc))
-        class_k = max(1, min(class_k, class_samples))
-        class_seed = seed + 1009 * (class_id + 1)
-        rng = np.random.default_rng(class_seed)
-        picked = np.asarray(rng.choice(class_indices, size=class_k, replace=False), dtype=np.int64)
+    # Count how many samples per (majority) class were selected
+    unique_labels, label_counts = np.unique(picked_labels, return_counts=True)
 
-        index_chunks.append(torch.from_numpy(picked))
-        label_chunks.append(torch.full((class_k,), fill_value=class_id, dtype=torch.long))
-        count_chunks.append(torch.ones((class_k,), dtype=torch.long))
+    print(f"[Random-Global] total_selected={total_k} out_of={n_total}")
+    for lbl, cnt in zip(unique_labels, label_counts):
+        print(f"  class={lbl} selected={cnt}")
 
-        print(f"[Random-Class] class={class_id} samples={class_samples} selected={class_k}")
-
-    if not index_chunks:
-        raise RuntimeError("Random distillation failed: no samples selected.")
-
-    indices_t = torch.cat(index_chunks, dim=0).long()
-    labels_t = torch.cat(label_chunks, dim=0).long()
-    counts_t = torch.cat(count_chunks, dim=0).long()
-    weights_t = compute_classwise_cluster_weights(
+    indices_t = torch.from_numpy(picked).long()
+    labels_t = torch.from_numpy(picked_labels).long()
+    counts_t = torch.ones((total_k,), dtype=torch.long)
+    weights_t = compute_cluster_weights(
         counts_t=counts_t,
         labels_t=labels_t,
         num_classes=num_classes,
@@ -568,7 +561,7 @@ def classwise_random_selection(
     return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
 
 
-def classwise_kmeans_nearest_selection(
+def global_kmeans_nearest_selection(
     latents: torch.Tensor,
     labels: torch.Tensor,
     clusters_per_class: float,
@@ -579,59 +572,44 @@ def classwise_kmeans_nearest_selection(
     weight_smooth: float = 0.0,
     per_class_ipc: dict[int, int] | None = None,
 ) -> SelectedSamplesResult:
+    """Global KMeans clustering across all classes, then select nearest samples."""
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
 
-    ipc = float(clusters_per_class)
     per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
     kmeans_max_iter = max(10, int(kmeans_max_iter))
     flat_latents = latents.float().cpu().view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
     labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
+    n_samples = int(flat_latents.shape[0])
 
-    index_chunks: list[torch.Tensor] = []
-    label_chunks: list[torch.Tensor] = []
-    count_chunks: list[torch.Tensor] = []
+    # Compute total cluster budget
+    if per_class:
+        total_k = sum(per_class.values())
+    else:
+        total_k = int(clusters_per_class * num_classes)
+    total_k = max(1, min(total_k, n_samples))
 
-    for class_id in range(num_classes):
-        class_indices = np.flatnonzero(labels_np == class_id)
-        class_samples = int(class_indices.shape[0])
-        if class_samples == 0:
-            warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
-            continue
+    # Run global KMeans
+    kmeans = KMeans(n_clusters=total_k, random_state=seed, n_init=10, max_iter=kmeans_max_iter)
+    assignments = kmeans.fit_predict(flat_latents)
+    counts = np.bincount(assignments, minlength=total_k).astype(np.int64)
 
-        class_k = per_class.get(class_id, target_count_for_class(class_samples, ipc))
-        class_k = max(1, min(class_k, class_samples))
-        class_seed = seed + 1009 * (class_id + 1)
-        class_latents = flat_latents[class_indices]
+    # Select nearest unique sample to each cluster center
+    nearest_global = nearest_samples_to_centers_unique(flat_latents, kmeans.cluster_centers_)
+    selected_labels = labels_np[nearest_global]
 
-        kmeans = KMeans(n_clusters=class_k, random_state=class_seed, n_init=10, max_iter=kmeans_max_iter)
-        assignments = kmeans.fit_predict(class_latents)
-        nearest_local = nearest_samples_to_centers_unique(class_latents, kmeans.cluster_centers_)
-        picked_global = class_indices[nearest_local]
-        counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
-
-        index_chunks.append(torch.from_numpy(picked_global.astype(np.int64, copy=False)))
-        label_chunks.append(torch.full((class_k,), fill_value=class_id, dtype=torch.long))
-        count_chunks.append(torch.from_numpy(counts).long())
-
-        print(
-            f"[KMeans-Class] class={class_id} samples={class_samples} "
-            f"selected={class_k} max_iter={kmeans_max_iter}"
-        )
-
-    if not index_chunks:
-        raise RuntimeError("KMeans distillation failed: no samples selected.")
-
-    indices_t = torch.cat(index_chunks, dim=0).long()
-    labels_t = torch.cat(label_chunks, dim=0).long()
-    counts_t = torch.cat(count_chunks, dim=0).long()
-    weights_t = compute_classwise_cluster_weights(
+    indices_t = torch.from_numpy(nearest_global.astype(np.int64, copy=False)).long()
+    labels_t = torch.from_numpy(selected_labels).long()
+    counts_t = torch.from_numpy(counts).long()
+    weights_t = compute_cluster_weights(
         counts_t=counts_t,
         labels_t=labels_t,
         num_classes=num_classes,
         strategy=weighting_strategy,
         weight_smooth=weight_smooth,
     )
+
+    print(f"[KMeans-Global] n_samples={n_samples} total_k={total_k} max_iter={kmeans_max_iter}")
 
     return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
 
@@ -695,7 +673,7 @@ def iter_images_by_indices(
         yield torch.stack(images, dim=0), torch.stack(labels, dim=0).long()
 
 
-def classwise_clvq(
+def global_clvq(
     latents: torch.Tensor,
     labels: torch.Tensor,
     clusters_per_class: float,
@@ -710,118 +688,101 @@ def classwise_clvq(
     kmeans_max_iter: int = 300,
     weight_smooth: float = 0.0,
 ) -> CLVQResult:
+    """Global CLVQ clustering across all classes (no longer per-class).
+
+    Runs MiniBatchKMeans on all latents at once, then assigns each cluster
+    a label via majority vote of the samples assigned to it.
+    """
     if clusters_per_class <= 0:
         raise ValueError("clusters_per_class must be positive.")
 
-    print(
-        "[CLVQ] Using class-wise clustering (MiniBatchKMeans for large classes, "
-        "standard KMeans for tight ratio classes)."
-    )
-
-    ipc = float(clusters_per_class)
     per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
-
     minibatch_size = max(32, int(minibatch_size))
     max_iter = max(10, int(max_iter))
 
     latents = latents.float().cpu()
     labels = labels.long().view(-1).cpu()
-
     flat_latents = latents.view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
     labels_np = labels.numpy().astype(np.int64, copy=False)
+    n_samples = int(flat_latents.shape[0])
 
-    center_chunks: list[torch.Tensor] = []
-    label_chunks: list[torch.Tensor] = []
-    count_chunks: list[torch.Tensor] = []
+    # Compute total cluster budget
+    if per_class:
+        total_k = sum(per_class.values())
+    else:
+        total_k = int(clusters_per_class * num_classes)
+    total_k = max(1, min(total_k, n_samples))
 
-    for class_id in range(num_classes):
-        class_selector = labels_np == class_id
-        class_latents = flat_latents[class_selector]
-        class_samples = int(class_latents.shape[0])
-        if class_samples == 0:
-            warnings.warn(f"Class {class_id} has no samples; skipping.", RuntimeWarning)
-            continue
-
-        target_k = per_class.get(class_id, target_count_for_class(class_samples, ipc))
-        target_k = max(1, min(target_k, class_samples))
-        class_k = target_k
-        class_seed = seed + 1009 * (class_id + 1)
-
-        # ── Tiered clustering: no‑op / MiniBatchKMeans / KMeans fallback ──
-        if class_samples <= target_k:
-            # Not enough samples — use all latent vectors directly as centers.
-            centers = class_latents.astype(np.float32, copy=True)
-            counts = np.ones(class_samples, dtype=np.int64)
-            backend_label = "NoCluster"
-        else:
-            # Try MiniBatchKMeans first; fall back to standard KMeans if empty clusters appear.
-            kmeans_mb = MiniBatchKMeans(
-                n_clusters=class_k,
-                random_state=class_seed,
-                batch_size=minibatch_size,
-                max_iter=max_iter,
-                n_init=3,
-                tol=float(max(tol, 1e-8)),
-                reassignment_ratio=0.01,
-            )
-            assignments = kmeans_mb.fit_predict(class_latents)
-            centers = kmeans_mb.cluster_centers_.astype(np.float32, copy=False)
-            counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
-
-            if int((counts == 0).sum()) > 0:
-                # Empty clusters detected → retry with standard KMeans.
-                kmeans_full = KMeans(
-                    n_clusters=class_k,
-                    random_state=class_seed,
-                    n_init=10,
-                    max_iter=max(300, int(kmeans_max_iter)),
-                )
-                assignments = kmeans_full.fit_predict(class_latents)
-                centers = kmeans_full.cluster_centers_.astype(np.float32, copy=False)
-                counts = np.bincount(assignments, minlength=class_k).astype(np.int64)
-                backend_label = "KMeans(retry)"
-            else:
-                backend_label = "MiniBatchKMeans"
-
-        if medoid_anchor > 0.0:
-            centers = anchor_centers_to_medoids(
-                data=class_latents,
-                centers=centers,
-                anchor=medoid_anchor,
-                batch_size=2048,
-            )
-            assignments = assign_to_centers(class_latents, centers, batch_size=2048)
-            counts = np.bincount(assignments, minlength=centers.shape[0]).astype(np.int64)
-
-        non_empty_mask = counts > 0
-        centers = centers[non_empty_mask]
-        counts = counts[non_empty_mask]
-
-        if centers.shape[0] == 0:
-            continue
-
-        center_chunks.append(torch.from_numpy(centers).view(centers.shape[0], *latents.shape[1:]).float())
-        label_chunks.append(torch.full((centers.shape[0],), fill_value=class_id, dtype=torch.long))
-        count_chunks.append(torch.from_numpy(counts))
-
-        print(
-            f"[CLVQ/{backend_label}-Class] class={class_id} samples={class_samples} "
-            f"target_k={target_k} used={class_k} kept={centers.shape[0]} "
-            f"batch_size={minibatch_size} max_iter={max_iter} medoid_anchor={medoid_anchor:.2f}"
+    if n_samples <= total_k:
+        # Not enough samples — use all latent vectors directly as centers.
+        centers = flat_latents.astype(np.float32, copy=True)
+        # Assign each sample to itself (identity)
+        assignments = np.arange(n_samples, dtype=np.int64)
+        counts = np.ones(n_samples, dtype=np.int64)
+        backend_label = "NoCluster"
+    else:
+        # Use MiniBatchKMeans exclusively for global clustering.
+        kmeans_mb = MiniBatchKMeans(
+            n_clusters=total_k,
+            random_state=seed,
+            batch_size=minibatch_size,
+            max_iter=max_iter,
+            n_init=3,
+            tol=float(max(tol, 1e-8)),
+            reassignment_ratio=0.01,
         )
+        assignments = kmeans_mb.fit_predict(flat_latents)
+        centers = kmeans_mb.cluster_centers_.astype(np.float32, copy=False)
+        counts = np.bincount(assignments, minlength=total_k).astype(np.int64)
+        backend_label = "MiniBatchKMeans"
 
-    if not center_chunks:
-        raise RuntimeError("Class-wise MiniBatchKMeans failed: no centers produced.")
+    if medoid_anchor > 0.0:
+        centers = anchor_centers_to_medoids(
+            data=flat_latents,
+            centers=centers,
+            anchor=medoid_anchor,
+            batch_size=2048,
+        )
+        assignments = assign_to_centers(flat_latents, centers, batch_size=2048)
+        counts = np.bincount(assignments, minlength=centers.shape[0]).astype(np.int64)
 
-    centers_t = torch.cat(center_chunks, dim=0)
-    labels_t = torch.cat(label_chunks, dim=0)
-    counts_t = torch.cat(count_chunks, dim=0)
-    weights_t = compute_classwise_cluster_weights(
+    # Remove empty clusters
+    non_empty_mask = counts > 0
+    centers = centers[non_empty_mask]
+    counts = counts[non_empty_mask]
+
+    if centers.shape[0] == 0:
+        raise RuntimeError("Global CLVQ failed: no centers produced.")
+
+    # Recompute assignments for non-empty centers
+    if not np.all(non_empty_mask):
+        assignments = assign_to_centers(flat_latents, centers, batch_size=2048)
+        counts = np.bincount(assignments, minlength=centers.shape[0]).astype(np.int64)
+
+    # Compute majority label per cluster
+    center_labels_arr = np.zeros(centers.shape[0], dtype=np.int64)
+    for c in range(centers.shape[0]):
+        mask = assignments == c
+        if mask.any():
+            cluster_sample_labels = labels_np[mask]
+            majority = np.bincount(cluster_sample_labels).argmax()
+            center_labels_arr[c] = majority
+
+    centers_t = torch.from_numpy(centers).view(centers.shape[0], *latents.shape[1:]).float()
+    labels_t = torch.from_numpy(center_labels_arr).long()
+    counts_t = torch.from_numpy(counts).long()
+    weights_t = compute_cluster_weights(
         counts_t=counts_t,
         labels_t=labels_t,
         num_classes=num_classes,
         strategy=weighting_strategy,
         weight_smooth=weight_smooth,
+    )
+
+    print(
+        f"[CLVQ/{backend_label}-Global] n_samples={n_samples} total_k={total_k} "
+        f"kept={centers.shape[0]} batch_size={minibatch_size} max_iter={max_iter} "
+        f"medoid_anchor={medoid_anchor:.2f}"
     )
 
     return CLVQResult(
@@ -1601,7 +1562,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     decoder: ReverseSDEDecoder | DiTDecoder | None = None
 
     if args.distill_method == "clvq":
-        clvq = classwise_clvq(
+        clvq = global_clvq(
             latents=latents,
             labels=latent_labels,
             clusters_per_class=args.clusters_per_class,
@@ -1673,7 +1634,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_counts = clvq.counts
         distilled_weights = clvq.weights
     elif args.distill_method == "random":
-        selected = classwise_random_selection(
+        selected = global_random_selection(
             labels=latent_labels,
             clusters_per_class=args.clusters_per_class,
             num_classes=num_classes,
@@ -1694,7 +1655,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_weights = selected.weights
         best_of_n_stream = False
     elif args.distill_method == "kmeans":
-        selected = classwise_kmeans_nearest_selection(
+        selected = global_kmeans_nearest_selection(
             latents=latents,
             labels=latent_labels,
             clusters_per_class=args.clusters_per_class,
@@ -1925,7 +1886,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Dataset distillation: explicit teacher baseline + VAE encode + "
-            "class-wise CLVQ (implemented via MiniBatchKMeans) / KMeans / Random selection "
+            "global CLVQ (MiniBatchKMeans across all classes) / KMeans / Random selection "
             "+ optional reverse-SDE decode"
         )
     )

@@ -279,7 +279,7 @@ def _normalize_dataset_key(dataset: str) -> str:
     return DATASET_KEY_ALIASES.get(key, key)
 
 
-class DistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+class DistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
         images: torch.Tensor,
@@ -291,7 +291,6 @@ class DistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Te
         self.images = images.float().cpu()
         self.weights = weights.float().cpu()
         self.soft_labels = soft_labels.float().cpu()
-        self.hard_labels = torch.argmax(self.soft_labels, dim=1).long()
         self.transform = transform
 
     @override
@@ -299,12 +298,11 @@ class DistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Te
         return int(self.images.size(0))
 
     @override
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image = self.transform(self.images[index])
         soft = self.soft_labels[index]
-        hard = self.hard_labels[index]
         weight = self.weights[index]
-        return image, soft, hard, weight
+        return image, soft, weight
     
 
 '''

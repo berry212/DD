@@ -356,7 +356,7 @@ class DistilledImageAccessor:
         return self._cached_shard_images[local_index].float().cpu()
 
 
-class LazyDistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+class LazyDistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
         image_accessor: DistilledImageAccessor,
@@ -368,7 +368,6 @@ class LazyDistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torc
         self.image_accessor = image_accessor
         self.weights = weights.float().cpu()
         self.soft_labels = soft_labels.float().cpu()
-        self.hard_labels = torch.argmax(self.soft_labels, dim=1).long()
         self.transform = transform
 
     @override
@@ -376,15 +375,14 @@ class LazyDistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torc
         return len(self.image_accessor)
 
     @override
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image = self.transform(self.image_accessor.get_image(index))
         soft = self.soft_labels[index]
-        hard = self.hard_labels[index]
         weight = self.weights[index]
-        return image, soft, hard, weight
+        return image, soft, weight
 
 
-class DistilledTTMBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]):
+class DistilledTTMBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
         image_accessor: DistilledImageAccessor,
@@ -414,7 +412,7 @@ class DistilledTTMBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
         return int(self.batch_indices.size(0))
 
     @override
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         idx = int(index)
         indices = self.batch_indices[idx]
         soft_labels = self.batch_soft_labels[idx]
@@ -436,14 +434,13 @@ class DistilledTTMBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.T
         std = self.std.to(dtype=batch_images.dtype)
         batch_images = (batch_images - mean.unsqueeze(0)) / std.unsqueeze(0)
 
-        hard_labels = torch.argmax(soft_labels, dim=1).long()
         sample_weights = self.weights[indices].float()
-        return batch_images, soft_labels.float(), hard_labels, sample_weights
+        return batch_images, soft_labels.float(), sample_weights
 
 
 def unwrap_single_batch(
-    samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if len(samples) != 1:
         raise ValueError(f"Expected a single pre-batched sample, received {len(samples)}")
     return samples[0]
@@ -461,7 +458,7 @@ def sharpen_soft_labels(soft_labels: torch.Tensor, temperature: float) -> torch.
 
 def blend_sample_weights(
     weights: torch.Tensor,
-    hard_labels: torch.Tensor,
+    pseudo_labels: torch.Tensor,
     num_classes: int,
     balance_alpha: float,
 ) -> torch.Tensor:
@@ -475,13 +472,13 @@ def blend_sample_weights(
 
     base = base / base.mean().clamp_min(1e-12)
 
-    class_counts = torch.bincount(hard_labels.long(), minlength=num_classes).float()
+    class_counts = torch.bincount(pseudo_labels.long(), minlength=num_classes).float()
     class_counts = class_counts.clamp_min(0.0)
     present = class_counts > 0
     inv = torch.zeros_like(class_counts)
     inv[present] = 1.0 / class_counts[present]
 
-    balanced = inv[hard_labels.long()]
+    balanced = inv[pseudo_labels.long()]
     balanced = balanced / balanced.mean().clamp_min(1e-12)
 
     mixed = (1.0 - alpha) * base + alpha * balanced
@@ -612,7 +609,6 @@ def train_student(
     amp_enabled: bool,
     output_dir: Path,
     kd_temperature: float,
-    hard_label_alpha: float,
 ) -> dict[str, Any]:
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(epochs), 1))
@@ -625,46 +621,35 @@ def train_student(
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
-        epoch_soft_loss = 0.0
-        epoch_hard_loss = 0.0
         epoch_correct = 0
         epoch_samples = 0
 
         temp = float(max(kd_temperature, 1e-6))
-        hard_alpha = float(np.clip(hard_label_alpha, 0.0, 1.0))
 
-        for images, soft_labels, hard_labels, sample_weights in train_loader:
+        for images, soft_labels, sample_weights in train_loader:
             images = images.to(device)
             soft_labels = soft_labels.to(device=device, dtype=torch.float32)
-            hard_labels = hard_labels.to(device)
             sample_weights = sample_weights.to(device=device, dtype=torch.float32)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 logits = model(images)
                 student_log_probs = F.log_softmax(logits.float() / temp, dim=1)
-                per_sample_soft_ce = -(soft_labels * student_log_probs).sum(dim=1)
-                soft_loss = (per_sample_soft_ce * sample_weights).sum() / float(max(images.size(0), 1))
-                soft_loss = soft_loss * (temp * temp)
-
-                per_sample_hard_ce = F.cross_entropy(logits.float(), hard_labels, reduction="none")
-                hard_loss = (per_sample_hard_ce * sample_weights).sum() / float(max(images.size(0), 1))
-
-                loss = (1.0 - hard_alpha) * soft_loss + hard_alpha * hard_loss
+                per_sample_ce = -(soft_labels * student_log_probs).sum(dim=1)
+                loss = (per_sample_ce * sample_weights).sum() / float(max(images.size(0), 1))
+                loss = loss * (temp * temp)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
 
             epoch_loss += float(loss.item()) * images.size(0)
-            epoch_soft_loss += float(soft_loss.item()) * images.size(0)
-            epoch_hard_loss += float(hard_loss.item()) * images.size(0)
-            epoch_correct += int((logits.argmax(dim=1) == hard_labels).sum().item())
+            # Track accuracy using argmax of soft labels as pseudo-labels
+            pseudo_labels = soft_labels.argmax(dim=1)
+            epoch_correct += int((logits.argmax(dim=1) == pseudo_labels).sum().item())
             epoch_samples += images.size(0)
 
         train_loss = epoch_loss / max(epoch_samples, 1)
-        train_soft_loss = epoch_soft_loss / max(epoch_samples, 1)
-        train_hard_loss = epoch_hard_loss / max(epoch_samples, 1)
         train_acc = epoch_correct / max(epoch_samples, 1)
         val_loss, val_acc = evaluate_classifier(model, val_loader, device, amp_enabled=amp_enabled)
         test_loss, test_acc = evaluate_classifier(model, test_loader, device, amp_enabled=amp_enabled)
@@ -674,8 +659,6 @@ def train_student(
             {
                 "epoch": float(epoch),
                 "train_loss": train_loss,
-                "train_soft_loss": train_soft_loss,
-                "train_hard_loss": train_hard_loss,
                 "train_acc": train_acc,
                 "val_loss": val_loss,
                 "val_acc": val_acc,
@@ -753,10 +736,10 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     distilled_lora_path = distilled_bundle.lora_path
     image_accessor = DistilledImageAccessor(distilled_data_path, distilled_bundle)
 
-    hard_labels = torch.argmax(soft_labels, dim=1).long()
+    pseudo_labels = torch.argmax(soft_labels, dim=1).long()
     weights = blend_sample_weights(
         weights=weights,
-        hard_labels=hard_labels,
+        pseudo_labels=pseudo_labels,
         num_classes=num_classes,
         balance_alpha=args.weight_balance_alpha,
     )
@@ -789,15 +772,6 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         distilled_teacher_temperature=distilled_bundle.teacher_temperature,
     )
 
-    # ── Random / KMeans distillation → use hard labels (one‑hot) ──
-    resolved_hard_label_alpha = float(np.clip(args.hard_label_alpha, 0.0, 1.0))
-    if distilled_bundle.distill_method in {"random", "kmeans"}:
-        if resolved_hard_label_alpha < 1.0:
-            print(
-                f"[Setup] distill_method={distilled_bundle.distill_method} → "
-                f"forcing hard_label_alpha=1.0 (was {resolved_hard_label_alpha})"
-            )
-            resolved_hard_label_alpha = 1.0
     fkd_batches_used = 0
 
     if bool(args.use_fkd_batches) and distilled_bundle.fkd_batch_path:
@@ -898,7 +872,6 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         amp_enabled=amp_enabled,
         output_dir=output_dir,
         kd_temperature=resolved_kd_temperature,
-        hard_label_alpha=resolved_hard_label_alpha,
     )
 
     best_ckpt = torch.load(output_dir / "student_best.pt", map_location=device)
@@ -947,7 +920,6 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "train_batch_size": int(effective_train_batch_size),
         "kd_temperature": float(resolved_kd_temperature),
         "distilled_teacher_temperature": float(distilled_bundle.teacher_temperature),
-        "hard_label_alpha": float(resolved_hard_label_alpha),
         "weight_balance_alpha": float(args.weight_balance_alpha),
         "soft_label_sharpen": float(args.soft_label_sharpen),
         "best_epoch": int(training_summary["best_epoch"]),
@@ -988,7 +960,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--kd-temperature", type=float, default=0.0)
-    parser.add_argument("--hard-label-alpha", type=float, default=0.0)
     parser.add_argument("--weight-balance-alpha", type=float, default=0.0)
     parser.add_argument("--soft-label-sharpen", type=float, default=1.0)
     parser.add_argument("--train-crop-min-scale", type=float, default=0.08)
