@@ -7,8 +7,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
+
+# 必须在 import sklearn 之前设置，防止 PCA/KMeans 的 OpenBLAS/OpenMP 线程与 PyTorch 冲突
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import matplotlib
 
@@ -16,6 +22,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 from torch.utils.data import DataLoader
 from torchvision import transforms
@@ -43,9 +50,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--encode-batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=5000,
-                        help="降维最大样本数（t-SNE O(N²) 复杂度）")
+                        help="降维最大样本数（t-SNE O(N²) 复杂度），0=不限制")
+    parser.add_argument("--per-class-samples", type=int, default=0,
+                        help="每类别抽样数（0=不使用，>0时按类别分层抽样，优先于--max-samples）")
     parser.add_argument("--perplexity", type=float, default=30.0)
     parser.add_argument("--tsne-iter", type=int, default=2000)
+    parser.add_argument("--early-exagg", type=float, default=12.0,
+                        help="t-SNE early exaggeration，高值拉大类间距")
+    parser.add_argument("--learning-rate", type=float, default=None,
+                        help="t-SNE learning rate，默认 auto（设为 N/12 附近通常更好）")
+    parser.add_argument("--metric", type=str, default="cosine",
+                        choices=["cosine", "euclidean", "manhattan"],
+                        help="t-SNE 距离度量。高维空间建议 cosine 或 euclidean")
+    parser.add_argument("--target-class", type=int, default=-1,
+                        help="只降维可视化指定类别（默认-1=全部类别，>=0时只显示该类）")
     parser.add_argument("--point-size", type=float, default=6.0)
     parser.add_argument("--alpha", type=float, default=0.7)
     parser.add_argument("--dpi", type=int, default=200)
@@ -120,48 +138,104 @@ def main() -> None:
     print(f"[Latents] shape={X.shape} dim={latent_dim}")
     print(f"[Stats] mean={X.mean():.4f} std={X.std():.4f} min={X.min():.4f} max={X.max():.4f}")
 
-    # ── 4. 下采样（t-SNE O(N²) 太贵）──
-    if X.shape[0] > args.max_samples:
-        rng = np.random.default_rng(args.seed)
+    # ── 4. 按类别过滤 ──
+    if args.target_class >= 0:
+        mask = y == args.target_class
+        X = X[mask]
+        y = y[mask]
+        target_class_name = class_names[args.target_class]
+        print(f"[Filter] keeping only class {args.target_class} ({target_class_name}), "
+              f"samples={X.shape[0]}")
+    else:
+        print(f"[Filter] keeping all {num_classes} classes")
+
+    # ── 5. 分层抽样 ──
+    rng = np.random.default_rng(args.seed)
+    if args.per_class_samples > 0:
+        # 按类别分层抽样
+        k = args.per_class_samples
+        selected_indices: list[int] = []
+        for class_id in range(num_classes):
+            class_idx = np.where(y == class_id)[0]
+            available = int(class_idx.shape[0])
+            take = min(k, available)
+            if take == 0:
+                continue
+            chosen = rng.choice(class_idx, size=take, replace=False)
+            selected_indices.extend(chosen.tolist())
+            print(f"[Stratified] class={class_id} available={available} sampled={take}")
+        selected = np.array(selected_indices, dtype=np.int64)
+        X = X[selected]
+        y = y[selected]
+        print(f"[Stratified] total={X.shape[0]}")
+    elif args.max_samples > 0 and X.shape[0] > args.max_samples:
         selected = rng.choice(X.shape[0], size=args.max_samples, replace=False)
         X = X[selected]
         y = y[selected]
-        print(f"[Subsample] down to {X.shape[0]} samples")
+        print(f"[Subsample] random down to {X.shape[0]} samples")
+    
+    # ── 5.5 PCA 预降维 ──
+    # 先降到 50-100 维（randomized SVD 避免线程冲突）
+    pca_dim = min(100, X.shape[1], X.shape[0] - 1)
+    print(f"[PCA] reducing from {X.shape[1]} to {pca_dim} dims...", flush=True)
+    pca = PCA(n_components=pca_dim, svd_solver="randomized", random_state=args.seed)
+    X = pca.fit_transform(X)
+    print(f"[PCA] done. explained={pca.explained_variance_ratio_.sum():.4f}", flush=True)
 
-    # ── 5. t-SNE 降维 ──
-    print(f"[t-SNE] perplexity={args.perplexity} max_iter={args.tsne_iter} ...")
+    # ── 6. t-SNE 降维 ──
+    lr = args.learning_rate if args.learning_rate is not None else max(X.shape[0] / 12., 200.)
+    print(f"[t-SNE] metric={args.metric} perplexity={args.perplexity} "
+          f"max_iter={args.tsne_iter} lr={lr:.0f} early_exagg={args.early_exagg} ...")
     tsne = TSNE(
         n_components=2,
+        metric=args.metric,
         perplexity=min(args.perplexity, X.shape[0] - 1),
         max_iter=args.tsne_iter,
+        learning_rate=lr,
+        early_exaggeration=args.early_exagg,
         random_state=args.seed,
         verbose=1,
     )
     X_2d = tsne.fit_transform(X)
     print(f"[t-SNE] done. shape={X_2d.shape}")
 
-    # ── 6. 可视化 ──
-    n_colors = num_classes
-    cmap = plt.cm.get_cmap("tab10", n_colors)
+    # ── 7. 可视化 ──
+    n_colors = num_classes if args.target_class < 0 else 1
+    cmap = plt.get_cmap("tab10", max(num_classes, 1))
 
     fig, ax = plt.subplots(figsize=tuple(args.figsize))
-    for class_id in range(num_classes):
-        mask = y == class_id
-        if not mask.any():
-            continue
+
+    if args.target_class >= 0:
+        # 单类别：用单色绘制
         ax.scatter(
-            X_2d[mask, 0],
-            X_2d[mask, 1],
-            c=[cmap(class_id)],
-            label=class_names[class_id],
+            X_2d[:, 0],
+            X_2d[:, 1],
+            c=[cmap(args.target_class % 10)],
+            label=target_class_name,
             s=args.point_size,
             alpha=args.alpha,
             edgecolors="none",
         )
+    else:
+        for class_id in range(num_classes):
+            mask = y == class_id
+            if not mask.any():
+                continue
+            ax.scatter(
+                X_2d[mask, 0],
+                X_2d[mask, 1],
+                c=[cmap(class_id)],
+                label=class_names[class_id],
+                s=args.point_size,
+                alpha=args.alpha,
+                edgecolors="none",
+            )
 
+    title_class = f"class {args.target_class} ({target_class_name})" if args.target_class >= 0 else "all classes"
     ax.set_title(
-        f"{dataset_spec.name} — VAE Latent Space t-SNE\n"
-        f"(n={X.shape[0]}, perplexity={args.perplexity}, latent_dim={latent_dim})",
+        f"{dataset_spec.name} — VAE Latent Space t-SNE ({title_class})\n"
+        f"(n={X.shape[0]}, perplexity={args.perplexity}, "
+        f"latent_dim={latent_dim}, metric={args.metric})",
         fontsize=14,
     )
     ax.set_xlabel("t-SNE dim 1")

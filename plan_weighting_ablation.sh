@@ -11,6 +11,7 @@ set -euo pipefail
 DATASETS=("dermamnist" "bloodmnist" "aptos-2019-blindness-detection")
 IPCS=(200 100 50 10)
 WEIGHTS=("uniform" "heuristic" "inverse")
+# WEIGHTS=("heuristic" "inverse")
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -27,26 +28,34 @@ for DATASET in "${DATASETS[@]}"; do
 
       echo ""
       echo ">>> [${DATASET}] IPC=${IPC} WEIGHT=${WEIGHT}"
-      echo "    distill → ${DISTILL_OUT}"
-      echo "    student → ${STUDENT_OUT}"
 
       # ── Distillation ──
-      DATASET="$DATASET" \
-      IPC="$IPC" \
-      WEIGHTING_STRATEGY="$WEIGHT" \
-      DISTILL_METHOD="clvq" \
-      MODEL_TYPE="sd" \
-      OUTPUT_DIR="$DISTILL_OUT" \
-      DATA_ROOT="data" \
-      bash "$SCRIPT_DIR/distillate.sh"
+      if [[ -f "${DISTILL_OUT}/distilled_data.pt" ]]; then
+        echo "    [SKIP] distill output exists: ${DISTILL_OUT}/distilled_data.pt"
+      else
+        echo "    distill → ${DISTILL_OUT}"
+        DATASET="$DATASET" \
+        IPC="$IPC" \
+        WEIGHTING_STRATEGY="$WEIGHT" \
+        DISTILL_METHOD="clvq" \
+        MODEL_TYPE="sd" \
+        OUTPUT_DIR="$DISTILL_OUT" \
+        DATA_ROOT="data" \
+        bash "$SCRIPT_DIR/distillate.sh"
+      fi
 
       # ── Student Training ──
-      DATASET="$DATASET" \
-      IPC="$IPC" \
-      DATA_ROOT="data" \
-      DISTILLED_DATA="${DISTILL_OUT}/distilled_data.pt" \
-      OUTPUT_DIR="$STUDENT_OUT" \
-      bash "$SCRIPT_DIR/train_student.sh"
+      if [[ -f "${STUDENT_OUT}/summary.json" ]]; then
+        echo "    [SKIP] student output exists: ${STUDENT_OUT}/summary.json"
+      else
+        echo "    student → ${STUDENT_OUT}"
+        DATASET="$DATASET" \
+        IPC="$IPC" \
+        DATA_ROOT="data" \
+        DISTILLED_DATA="${DISTILL_OUT}/distilled_data.pt" \
+        OUTPUT_DIR="$STUDENT_OUT" \
+        bash "$SCRIPT_DIR/train_student.sh"
+      fi
 
       echo "    ✓ done"
     done
