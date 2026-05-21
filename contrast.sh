@@ -78,7 +78,6 @@ run_method() {
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
       --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
       --mode-guidance-lambda "$GUIDANCE_LAMBDA" --mode-guidance-t-stop 80 \
-      --best-of-n-candidates 1 \
       --encode-batch-size 32 --decode-batch-size 32 \
       --no-fkd-precompute-batches --fp16 --num-workers 4
   else

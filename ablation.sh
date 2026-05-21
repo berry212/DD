@@ -80,7 +80,7 @@ for IPC in $IPC_LIST; do
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
       --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
-      --best-of-n-candidates 1 --mode-guidance-lambda 0.0 \
+      --mode-guidance-lambda 0.0 \
       --encode-batch-size 32 --decode-batch-size 32 \
       --no-fkd-precompute-batches --fp16 --num-workers 4
   else
@@ -129,7 +129,7 @@ for IPC in $IPC_LIST; do
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
       --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
-      --best-of-n-candidates 1 --mode-guidance-lambda 0.0 \
+      --mode-guidance-lambda 0.0 \
       --encode-batch-size 32 --decode-batch-size 32 \
       --no-fkd-precompute-batches --fp16 --num-workers 4
   else
@@ -178,7 +178,7 @@ for IPC in $IPC_LIST; do
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
       --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
-      --best-of-n-candidates 1 --mode-guidance-lambda 0.0 \
+      --mode-guidance-lambda 0.0 \
       --encode-batch-size 32 --decode-batch-size 32 \
       --no-fkd-precompute-batches --fp16 --num-workers 4
   else
@@ -227,7 +227,7 @@ for IPC in $IPC_LIST; do
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
       --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
-      --best-of-n-candidates 1 --mode-guidance-lambda 0.0 \
+      --mode-guidance-lambda 0.0 \
       --encode-batch-size 32 --decode-batch-size 32 \
       --no-fkd-precompute-batches --fp16 --num-workers 4
   else

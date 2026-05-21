@@ -20,13 +20,8 @@ BASELINE_DIR="${BASELINE_DIR:-outputs/${DATASET}_224_distill_baseline}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.0}"
 SDE_STEPS="${SDE_STEPS:-200}"
 SDE_NOISE_STRENGTH="${SDE_NOISE_STRENGTH:-0.2}"
-CLVQ_MEDOID_ANCHOR="${CLVQ_MEDOID_ANCHOR:-0.0}"
 WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-inverse}"
 MODEL_TYPE="${MODEL_TYPE:-sd}"
-BEST_OF_N_CANDIDATES="${BEST_OF_N_CANDIDATES:-1}"
-ADAPTIVE_IPC="${ADAPTIVE_IPC:-false}"
-ADAPTIVE_IPC_BETA="${ADAPTIVE_IPC_BETA:-0.5}"
-ADAPTIVE_IPC_MIN_FRACTION="${ADAPTIVE_IPC_MIN_FRACTION:-0.5}"
 WEIGHT_SMOOTH="${WEIGHT_SMOOTH:-0.5}"
 MODE_GUIDANCE_LAMBDA="${MODE_GUIDANCE_LAMBDA:-0.0}"
 MODE_GUIDANCE_T_STOP="${MODE_GUIDANCE_T_STOP:-80}"
@@ -96,11 +91,6 @@ if [[ "$FKD_PRECOMPUTE_BATCHES" == "false" ]]; then
   FKD_PRECOMPUTE_FLAG="--no-fkd-precompute-batches"
 fi
 
-ADAPTIVE_IPC_FLAGS=()
-if [[ "$ADAPTIVE_IPC" == "true" ]]; then
-  ADAPTIVE_IPC_FLAGS=(--adaptive-ipc --adaptive-ipc-beta "$ADAPTIVE_IPC_BETA" --adaptive-ipc-min-fraction "$ADAPTIVE_IPC_MIN_FRACTION")
-fi
-
 uv run run-distillation \
   --dataset "$DATASET" \
   --data-root "$DATA_ROOT" \
@@ -117,7 +107,6 @@ uv run run-distillation \
   --kmeans-max-iter "$KMEANS_MAX_ITER" \
   --clvq-max-iter "$CLVQ_MAX_ITER" \
   --clvq-batch-size "$CLVQ_BATCH_SIZE" \
-  --clvq-medoid-anchor "$CLVQ_MEDOID_ANCHOR" \
   --weighting-strategy "$WEIGHTING_STRATEGY" \
   --weight-smooth "$WEIGHT_SMOOTH" \
   --teacher-backbone "$TEACHER_BACKBONE" \
@@ -126,10 +115,8 @@ uv run run-distillation \
   --no-auto-train-teacher-baseline \
   --sde-steps "$SDE_STEPS" \
   --sde-noise-strength "$SDE_NOISE_STRENGTH" \
-  --best-of-n-candidates "$BEST_OF_N_CANDIDATES" \
   --mode-guidance-lambda "$MODE_GUIDANCE_LAMBDA" \
   --mode-guidance-t-stop "$MODE_GUIDANCE_T_STOP" \
-  "${ADAPTIVE_IPC_FLAGS[@]}" \
   --encode-batch-size 32 \
   --decode-batch-size 32 \
   "$FKD_PRECOMPUTE_FLAG" \

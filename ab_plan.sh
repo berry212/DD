@@ -17,9 +17,3 @@ for IPC in 200 100 50 10; do
     DISTILL_METHOD=kmeans DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
     DISTILL_METHOD=kmeans DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
 done
-
-# for IPC in 200 100 50 10; do
-#     BEST_OF_N_CANDIDATES=5 ADAPTIVE_IPC=true ADAPTIVE_IPC_BETA=0.5 MODEL_TYPE=unet DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash distillate.sh
-#     MODEL_TYPE=unet DATASET=$DATASET DATA_ROOT=data IPC=$IPC bash train_student.sh
-# done
-

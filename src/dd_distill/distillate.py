@@ -87,88 +87,6 @@ def teacher_confidence_scores(
     return torch.cat(confidences, dim=0)
 
 
-@torch.no_grad()
-def compute_teacher_per_class_accuracy(
-    teacher: nn.Module,
-    val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
-    num_classes: int,
-    device: torch.device,
-    amp_enabled: bool,
-) -> dict[int, float]:
-    """Evaluate teacher on a validation loader and return per‑class accuracy.
-
-    Returns a dict mapping class_id → accuracy in [0, 1].
-    """
-    teacher.eval()
-    correct_per_class = torch.zeros(num_classes, dtype=torch.int64)
-    total_per_class = torch.zeros(num_classes, dtype=torch.int64)
-
-    for images, labels in val_loader:
-        images = images.to(device)
-        labels = labels.to(device)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            logits = teacher(images)
-        preds = logits.argmax(dim=1)
-        for c in range(num_classes):
-            mask = labels == c
-            total_per_class[c] += mask.sum().item()
-            correct_per_class[c] += (preds[mask] == c).sum().item()
-
-    per_class_acc: dict[int, float] = {}
-    for c in range(num_classes):
-        if total_per_class[c] > 0:
-            per_class_acc[c] = float(correct_per_class[c].item()) / float(total_per_class[c].item())
-        else:
-            per_class_acc[c] = 0.0
-    return per_class_acc
-
-
-def compute_adaptive_ipc_allocation(
-    base_ipc: float,
-    per_class_acc: dict[int, float],
-    num_classes: int,
-    beta: float,
-    min_fraction: float,
-    per_class_sample_counts: dict[int, int] | None = None,
-) -> dict[int, int]:
-    """Allocate IPC per class based on teacher per‑class accuracy.
-
-    Hard classes (low teacher accuracy) receive more clusters:
-        ipc_c = base_ipc * (1 + beta * (1 - acc_c))
-    then normalised so that the total budget stays roughly constant and
-    no class gets fewer than min_fraction * base_ipc clusters.
-
-    Returns a dict mapping class_id → target_k (int, >= 1).
-    """
-    beta = float(max(0.0, beta))
-    min_frac = float(np.clip(min_fraction, 0.0, 1.0))
-    min_ipc = max(1.0, base_ipc * min_frac)
-
-    raw_ipc = {}
-    for c in range(num_classes):
-        acc = float(per_class_acc.get(c, 0.5))
-        raw = base_ipc * (1.0 + beta * (1.0 - acc))
-        raw_ipc[c] = raw
-
-    # Normalise to preserve total budget
-    total_raw = sum(raw_ipc.values())
-    if total_raw > 0:
-        scale = (base_ipc * num_classes) / total_raw
-    else:
-        scale = 1.0
-
-    allocation: dict[int, int] = {}
-    for c in range(num_classes):
-        scaled = raw_ipc[c] * scale
-        target = max(1, int(round(scaled)))
-        # Respect per-class sample count if provided
-        if per_class_sample_counts is not None:
-            target = min(target, per_class_sample_counts.get(c, target))
-        allocation[c] = max(1, target)
-
-    return allocation
-
-
 def build_encode_loader(
     train_set: Any,
     image_size: int,
@@ -456,41 +374,6 @@ def assign_to_centers(data: np.ndarray, centers: np.ndarray, batch_size: int = 2
     return assignments
 
 
-def anchor_centers_to_medoids(
-    data: np.ndarray,
-    centers: np.ndarray,
-    anchor: float,
-    batch_size: int = 2048,
-) -> np.ndarray:
-    if data.size == 0 or centers.size == 0:
-        raise ValueError("anchor_centers_to_medoids expects non-empty data and centers.")
-
-    alpha = float(np.clip(anchor, 0.0, 1.0))
-    if alpha <= 0.0:
-        return centers
-
-    center_norm = np.sum(centers * centers, axis=1)
-    best_dist = np.full((centers.shape[0],), fill_value=np.inf, dtype=np.float64)
-    best_samples = centers.copy()
-
-    for start in range(0, data.shape[0], batch_size):
-        end = min(data.shape[0], start + batch_size)
-        chunk = data[start:end]
-        chunk_norm = np.sum(chunk * chunk, axis=1, keepdims=True)
-        distances = chunk_norm + center_norm[None, :] - 2.0 * (chunk @ centers.T)
-
-        winner_rows = np.argmin(distances, axis=0)
-        winner_dist = distances[winner_rows, np.arange(centers.shape[0])]
-        improved = winner_dist < best_dist
-
-        if np.any(improved):
-            best_dist[improved] = winner_dist[improved]
-            best_samples[improved] = chunk[winner_rows[improved]]
-
-    anchored = (1.0 - alpha) * centers + alpha * best_samples
-    return anchored.astype(np.float32, copy=False)
-
-
 def nearest_samples_to_centers_unique(data: np.ndarray, centers: np.ndarray) -> np.ndarray:
     if data.size == 0 or centers.size == 0:
         raise ValueError("nearest_samples_to_centers_unique expects non-empty data and centers.")
@@ -682,7 +565,6 @@ def global_clvq(
     max_iter: int,
     tol: float,
     minibatch_size: int,
-    medoid_anchor: float,
     weighting_strategy: str,
     per_class_ipc: dict[int, int] | None = None,
     kmeans_max_iter: int = 300,
@@ -736,16 +618,6 @@ def global_clvq(
         counts = np.bincount(assignments, minlength=total_k).astype(np.int64)
         backend_label = "MiniBatchKMeans"
 
-    if medoid_anchor > 0.0:
-        centers = anchor_centers_to_medoids(
-            data=flat_latents,
-            centers=centers,
-            anchor=medoid_anchor,
-            batch_size=2048,
-        )
-        assignments = assign_to_centers(flat_latents, centers, batch_size=2048)
-        counts = np.bincount(assignments, minlength=centers.shape[0]).astype(np.int64)
-
     # Remove empty clusters
     non_empty_mask = counts > 0
     centers = centers[non_empty_mask]
@@ -781,8 +653,7 @@ def global_clvq(
 
     print(
         f"[CLVQ/{backend_label}-Global] n_samples={n_samples} total_k={total_k} "
-        f"kept={centers.shape[0]} batch_size={minibatch_size} max_iter={max_iter} "
-        f"medoid_anchor={medoid_anchor:.2f}"
+        f"kept={centers.shape[0]} batch_size={minibatch_size} max_iter={max_iter}"
     )
 
     return CLVQResult(
@@ -975,134 +846,6 @@ class ReverseSDEDecoder:
             print(f"[Decoding] {end}/{total}")
             yield imgs.float().cpu(), labels[start:end].long().cpu()
 
-    @torch.no_grad()
-    def _decode_best_of_n_batch(
-        self,
-        centers: torch.Tensor,
-        labels: torch.Tensor,
-        teacher: nn.Module,
-        num_candidates: int,
-        teacher_batch_size: int,
-        seed: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Generate *num_candidates* images per center, score with teacher,
-        and return the best candidate per center along with its confidence weight.
-
-        Returns:
-            best_images:  (B, C, H, W)  selected images in [0, 1]
-            best_labels:  (B,)  class labels (same as input labels)
-            conf_weights: (B,)  teacher confidence for the target class
-        """
-        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
-        timesteps = self.scheduler.timesteps
-
-        start_idx = int((1.0 - self.noise_strength) * (len(timesteps) - 1))
-        start_idx = max(0, min(start_idx, len(timesteps) - 1))
-        start_timestep = timesteps[start_idx]
-
-        B = centers.size(0)
-        N = max(1, int(num_candidates))
-
-        # Expand: (B, C, H, W) → (B*N, C, H, W)
-        centers_expanded = centers.unsqueeze(1).expand(B, N, *centers.shape[1:]).reshape(B * N, *centers.shape[1:])
-        labels_expanded = labels.unsqueeze(1).expand(B, N).reshape(B * N)
-
-        latents = centers_expanded.to(device=self.device, dtype=self.dtype)
-
-        # Independent noise per candidate
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(int(seed))
-        noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=self.dtype)
-        latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
-
-        cond_prompt_embeds = self._prompt_embeddings_for_labels(labels_expanded)
-        uncond_prompt_embeds = self._null_prompt_embeddings(latents.size(0)) if self.guidance_scale > 1.0 else None
-
-        # ── Preload alphas_cumprod for MGD³ x0‑prediction ──
-        alphas_cp = self.scheduler.alphas_cumprod.to(device=self.device, dtype=self.dtype)
-        # mode target for each candidate is the original (un‑expanded) center
-        mode_target = centers.to(device=self.device, dtype=self.dtype)
-
-        for step_i, timestep in enumerate(timesteps[start_idx:]):
-            model_input = self.scheduler.scale_model_input(latents, timestep)
-
-            if uncond_prompt_embeds is not None:
-                model_input = torch.cat([model_input, model_input], dim=0)
-                prompt_embeds = torch.cat([uncond_prompt_embeds, cond_prompt_embeds], dim=0)
-                noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=prompt_embeds).sample
-                noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
-            else:
-                noise_pred = self.pipe.unet(model_input, timestep, encoder_hidden_states=cond_prompt_embeds).sample
-
-            # ── MGD³ Mode Guidance ──
-            if self.mg_lambda > 0.0 and int(timestep.item()) > self.mg_t_stop:
-                alpha_bar_t = alphas_cp[timestep]
-                sqrt_alpha_bar = torch.sqrt(alpha_bar_t)
-                sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar_t)
-                x0_pred = (latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar
-                # expand mode_target to match B*N
-                m_target = mode_target.unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(B * N, *mode_target.shape[1:])
-                g_t = m_target - x0_pred
-                noise_pred = noise_pred + self.mg_lambda * g_t * sqrt_one_minus_alpha_bar
-                # ── end MGD³ ──
-
-            latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
-
-        images = self.pipe.vae.decode(latents / self.scaling_factor).sample
-        images = (images / 2.0 + 0.5).clamp(0.0, 1.0)
-
-        # Teacher scoring on all B*N candidates (ensure float32 for teacher)
-        confidences = teacher_confidence_scores(
-            teacher=teacher,
-            images=images.float(),
-            labels=labels_expanded,
-            batch_size=teacher_batch_size,
-            device=self.device,
-        )  # (B*N,)
-
-        # Reshape to (B, N) and select best per center
-        confidences_2d = confidences.view(B, N)
-        best_indices = confidences_2d.argmax(dim=1)  # (B,)
-        best_conf = confidences_2d[torch.arange(B, device=best_indices.device), best_indices]  # (B,)
-
-        # Gather best images
-        global_indices = best_indices + torch.arange(B, device=best_indices.device) * N
-        best_images = images[global_indices].float().cpu()
-        best_labels = labels.long().cpu()
-
-        return best_images, best_labels, best_conf.float().cpu()
-
-    @torch.no_grad()
-    def decode_best_of_n(
-        self,
-        centers: torch.Tensor,
-        labels: torch.Tensor,
-        batch_size: int,
-        teacher: nn.Module,
-        num_candidates: int,
-        teacher_batch_size: int,
-        seed: int,
-    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """Iterator version of best‑of‑N decoding.
-
-        Yields (best_images, best_labels, confidence_weights) per batch.
-        """
-        total = centers.size(0)
-        chunk_size = max(1, int(batch_size))
-        for start in range(0, total, chunk_size):
-            end = min(total, start + chunk_size)
-            best_imgs, best_lbls, conf_w = self._decode_best_of_n_batch(
-                centers=centers[start:end],
-                labels=labels[start:end],
-                teacher=teacher,
-                num_candidates=num_candidates,
-                teacher_batch_size=teacher_batch_size,
-                seed=seed + start // chunk_size,
-            )
-            print(f"[Best-of-N Decoding] {end}/{total}")
-            yield best_imgs, best_lbls, conf_w
-
     def cleanup(self) -> None:
         del self.pipe
         if torch.cuda.is_available():
@@ -1244,129 +987,6 @@ class DiTDecoder:
             imgs = self._decode_batch(centers[start:end], labels[start:end])
             print(f"[DiT-Decoding] {end}/{total}")
             yield imgs.float().cpu(), labels[start:end].long().cpu()
-
-    @torch.no_grad()
-    def _decode_best_of_n_batch(
-        self,
-        centers: torch.Tensor,
-        labels: torch.Tensor,
-        teacher: nn.Module,
-        num_candidates: int,
-        teacher_batch_size: int,
-        seed: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """DiT version: generate *num_candidates* images per center, score with teacher,
-        and return the best candidate per center along with its confidence weight.
-
-        Returns:
-            best_images:  (B, C, H, W)  selected images in [0, 1]
-            best_labels:  (B,)  class labels
-            conf_weights: (B,)  teacher confidence for the target class
-        """
-        self.scheduler.set_timesteps(self.num_inference_steps, device=self.device)
-        timesteps = self.scheduler.timesteps
-
-        start_idx = int((1.0 - self.noise_strength) * (len(timesteps) - 1))
-        start_idx = max(0, min(start_idx, len(timesteps) - 1))
-        start_timestep = timesteps[start_idx]
-
-        B = centers.size(0)
-        N = max(1, int(num_candidates))
-
-        # Expand: (B, C, H, W) → (B*N, C, H, W)
-        centers_expanded = centers.unsqueeze(1).expand(B, N, *centers.shape[1:]).reshape(B * N, *centers.shape[1:])
-        labels_expanded = labels.unsqueeze(1).expand(B, N).reshape(B * N)
-
-        latents = centers_expanded.to(device=self.device, dtype=self.dtype)
-
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(int(seed))
-        noise = torch.randn(latents.shape, generator=generator, device=self.device, dtype=self.dtype)
-        latents = self.scheduler.add_noise(latents, noise, start_timestep.expand(latents.size(0)))
-        class_labels_expanded = labels_expanded.to(device=self.device, dtype=torch.long)
-
-        # ── Preload alphas_cumprod for MGD³ x0‑prediction ──
-        alphas_cp = self.scheduler.alphas_cumprod.to(device=self.device, dtype=self.dtype)
-        mode_target = centers.to(device=self.device, dtype=self.dtype)
-
-        for step_i, timestep in enumerate(timesteps[start_idx:]):
-            model_input = self.scheduler.scale_model_input(latents, timestep)
-            t_batch = timestep.expand(latents.size(0))
-            noise_pred = self.pipe.transformer(
-                model_input, t_batch, class_labels=class_labels_expanded
-            ).sample
-            if noise_pred.size(1) == 8:
-                noise_pred = noise_pred[:, :4]
-
-            # ── MGD³ Mode Guidance ──
-            if self.mg_lambda > 0.0 and int(timestep.item()) > self.mg_t_stop:
-                alpha_bar_t = alphas_cp[timestep]
-                sqrt_alpha_bar = torch.sqrt(alpha_bar_t)
-                sqrt_one_minus_alpha_bar = torch.sqrt(1.0 - alpha_bar_t)
-                x0_pred = (latents - sqrt_one_minus_alpha_bar * noise_pred) / sqrt_alpha_bar
-                m_target = mode_target.unsqueeze(1).expand(-1, N, -1, -1, -1).reshape(B * N, *mode_target.shape[1:])
-                g_t = m_target - x0_pred
-                noise_pred = noise_pred + self.mg_lambda * g_t * sqrt_one_minus_alpha_bar
-                # ── end MGD³ ──
-
-            latents = self.scheduler.step(noise_pred, timestep, latents).prev_sample
-
-        images = self.pipe.vae.decode(latents / self.scaling_factor).sample
-        images = (images / 2.0 + 0.5).clamp(0.0, 1.0)
-
-        if images.shape[-1] != self.output_size:
-            images = F.interpolate(images, size=(self.output_size, self.output_size),
-                                   mode="bilinear", align_corners=False)
-
-        # Teacher scoring on all B*N candidates (ensure float32 for teacher)
-        confidences = teacher_confidence_scores(
-            teacher=teacher,
-            images=images.float(),
-            labels=labels_expanded,
-            batch_size=teacher_batch_size,
-            device=self.device,
-        )  # (B*N,)
-
-        # Reshape to (B, N) and select best per center
-        confidences_2d = confidences.view(B, N)
-        best_indices = confidences_2d.argmax(dim=1)
-        best_conf = confidences_2d[torch.arange(B, device=best_indices.device), best_indices]
-
-        global_indices = best_indices + torch.arange(B, device=best_indices.device) * N
-        best_images = images[global_indices].float().cpu()
-        best_labels = labels.long().cpu()
-
-        return best_images, best_labels, best_conf.float().cpu()
-
-    @torch.no_grad()
-    def decode_best_of_n(
-        self,
-        centers: torch.Tensor,
-        labels: torch.Tensor,
-        batch_size: int,
-        teacher: nn.Module,
-        num_candidates: int,
-        teacher_batch_size: int,
-        seed: int,
-    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """DiT iterator version of best‑of‑N decoding.
-
-        Yields (best_images, best_labels, confidence_weights) per batch.
-        """
-        total = centers.size(0)
-        chunk_size = max(1, int(batch_size))
-        for start in range(0, total, chunk_size):
-            end = min(total, start + chunk_size)
-            best_imgs, best_lbls, conf_w = self._decode_best_of_n_batch(
-                centers=centers[start:end],
-                labels=labels[start:end],
-                teacher=teacher,
-                num_candidates=num_candidates,
-                teacher_batch_size=teacher_batch_size,
-                seed=seed + start // chunk_size,
-            )
-            print(f"[DiT Best-of-N Decoding] {end}/{total}")
-            yield best_imgs, best_lbls, conf_w
 
     def cleanup(self) -> None:
         del self.pipe
@@ -1511,48 +1131,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     stream_batch_size = max(1, int(args.save_batch_size))
 
-    # --- Adaptive IPC: compute per‑class teacher accuracy and re‑allocate clusters ---
     per_class_ipc: dict[int, int] | None = None
-    if bool(args.adaptive_ipc):
-        from .baseline_resnet18 import build_teacher_transforms
 
-        _, eval_transform = build_teacher_transforms(args.image_size, args.teacher_backbone)
-        val_loader_for_acc: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
-            TorchDataset(val_set, transform=eval_transform),
-            batch_size=args.eval_batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=False,
-        )
-        per_class_acc = compute_teacher_per_class_accuracy(
-            teacher=teacher,
-            val_loader=val_loader_for_acc,
-            num_classes=num_classes,
-            device=device,
-            amp_enabled=amp_enabled,
-        )
-        # Count per‑class training samples for capping
-        latent_labels_np = latent_labels.long().view(-1).numpy()
-        per_class_samples = {
-            c: int((latent_labels_np == c).sum()) for c in range(num_classes)
-        }
-        per_class_ipc = compute_adaptive_ipc_allocation(
-            base_ipc=args.clusters_per_class,
-            per_class_acc=per_class_acc,
-            num_classes=num_classes,
-            beta=args.adaptive_ipc_beta,
-            min_fraction=args.adaptive_ipc_min_fraction,
-            per_class_sample_counts=per_class_samples,
-        )
-        print(f"[Adaptive IPC] beta={args.adaptive_ipc_beta:.2f} min_frac={args.adaptive_ipc_min_fraction:.2f}")
-        for c in range(num_classes):
-            acc_str = f"{per_class_acc.get(c, 0.0):.3f}"
-            print(f"  class={c} acc={acc_str} ipc={per_class_ipc.get(c, 'N/A')}")
-
-    best_of_n_candidates = max(1, int(args.best_of_n_candidates))
-    best_of_n_enabled = best_of_n_candidates > 1
-    if best_of_n_enabled:
-        print(f"[Best-of-N] enabled with num_candidates={best_of_n_candidates}")
     if args.mode_guidance_lambda > 0.0:
         print(
             f"[MGD³] mode guidance enabled: λ={args.mode_guidance_lambda:.3f} "
@@ -1571,7 +1151,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             max_iter=args.clvq_max_iter,
             tol=args.clvq_tol,
             minibatch_size=args.clvq_batch_size,
-            medoid_anchor=args.clvq_medoid_anchor,
             weighting_strategy=args.weighting_strategy,
             per_class_ipc=per_class_ipc,
             kmeans_max_iter=args.kmeans_max_iter,
@@ -1610,25 +1189,11 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         decode_bs = min(stream_batch_size, max(1, int(args.decode_batch_size)))
-        if best_of_n_enabled:
-            stream_iter = decoder.decode_best_of_n(
-                clvq.centers,
-                clvq.center_labels,
-                batch_size=decode_bs,
-                teacher=teacher,
-                num_candidates=best_of_n_candidates,
-                teacher_batch_size=args.eval_batch_size,
-                seed=args.seed + 9001,
-            )
-            # For Best‑of‑N, the stream yields (images, labels, confidence_weights)
-            best_of_n_stream = True
-        else:
-            stream_iter = decoder.decode_batches(
-                clvq.centers,
-                clvq.center_labels,
-                batch_size=decode_bs,
-            )
-            best_of_n_stream = False
+        stream_iter = decoder.decode_batches(
+            clvq.centers,
+            clvq.center_labels,
+            batch_size=decode_bs,
+        )
 
         distilled_labels = clvq.center_labels
         distilled_counts = clvq.counts
@@ -1653,7 +1218,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_labels = expected_labels
         distilled_counts = selected.counts
         distilled_weights = selected.weights
-        best_of_n_stream = False
     elif args.distill_method == "kmeans":
         selected = global_kmeans_nearest_selection(
             latents=latents,
@@ -1676,7 +1240,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_labels = expected_labels
         distilled_counts = selected.counts
         distilled_weights = selected.weights
-        best_of_n_stream = False
     else:
         raise ValueError(f"Unsupported distill method: {args.distill_method}")
 
@@ -1693,12 +1256,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
 
     try:
         for batch_idx, stream_item in enumerate(stream_iter, start=1):
-            if best_of_n_stream:
-                image_batch, label_batch, conf_weights = stream_item
-                conf_weights = conf_weights.float().cpu()
-            else:
-                image_batch, label_batch = stream_item
-                conf_weights = None
+            image_batch, label_batch = stream_item
 
             image_batch = image_batch.float().cpu()
             label_batch = label_batch.long().cpu()
@@ -1722,13 +1280,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
             )
             soft_label_chunks.append(soft_batch)
 
-            # Merge Best‑of‑N confidence weights with cluster weights
             batch_weights = distilled_weights[cursor : cursor + batch_n].float().cpu()
-            if conf_weights is not None:
-                batch_weights = batch_weights * conf_weights.clamp_min(0.0)
-                batch_weights = batch_weights / batch_weights.mean().clamp_min(1e-12)
-                # Update the global weights tensor in‑place so downstream serialisation picks up merged weights
-                distilled_weights[cursor : cursor + batch_n] = batch_weights
 
             rel_paths = save_distilled_images(
                 images=image_batch,
@@ -1853,7 +1405,6 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "distill_method": str(args.distill_method),
         "clustering_backend": "MiniBatchKMeans" if args.distill_method == "clvq" else str(args.distill_method),
         "clusters_per_class": float(args.clusters_per_class),
-        "clvq_medoid_anchor": float(args.clvq_medoid_anchor),
         "clvq_batch_size": int(args.clvq_batch_size),
         "clvq_minibatch_size": int(args.clvq_batch_size),
         "kmeans_max_iter": int(args.kmeans_max_iter),
@@ -1867,12 +1418,8 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "lora_path": resolved_lora_path,
         "latent_cache_path": str(latent_cache_path),
         "latent_source": latent_source,
-        "best_of_n_candidates": int(args.best_of_n_candidates),
         "mode_guidance_lambda": float(args.mode_guidance_lambda),
         "mode_guidance_t_stop": int(args.mode_guidance_t_stop),
-        "adaptive_ipc": bool(args.adaptive_ipc),
-        "adaptive_ipc_beta": float(args.adaptive_ipc_beta) if args.adaptive_ipc else 0.0,
-        "adaptive_ipc_min_fraction": float(args.adaptive_ipc_min_fraction) if args.adaptive_ipc else 0.0,
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -1900,7 +1447,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--clvq-max-iter", type=int, default=10000)
     parser.add_argument("--clvq-tol", type=float, default=1e-5)
     parser.add_argument("--clvq-batch-size", type=int, default=1024)
-    parser.add_argument("--clvq-medoid-anchor", type=float, default=0.0)
     parser.add_argument("--kmeans-max-iter", type=int, default=300)
     parser.add_argument(
         "--weighting-strategy",
@@ -1943,33 +1489,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--mode-guidance-t-stop", type=int, default=25,
         help="Stop mode guidance when timestep <= this value. "
              "Higher = stop earlier. 0 = never stop.",
-    )
-
-    # --- Best‑of‑N teacher‑guided decoding ---
-    parser.add_argument(
-        "--best-of-n-candidates", type=int, default=1,
-        help="Number of candidate images to generate per cluster center. "
-             "If > 1, teacher selects the best candidate. (default: 1 = off)",
-    )
-    parser.add_argument(
-        "--best-of-n-confidence-threshold", type=float, default=0.0,
-        help="Minimum teacher confidence to keep a distilled sample "
-             "(0 = keep all). Only used when best-of-n-candidates > 1.",
-    )
-
-    # --- Adaptive IPC ---
-    parser.add_argument(
-        "--adaptive-ipc", action=argparse.BooleanOptionalAction, default=False,
-        help="Allocate more clusters to hard classes based on teacher per‑class accuracy.",
-    )
-    parser.add_argument(
-        "--adaptive-ipc-beta", type=float, default=0.5,
-        help="Strength of adaptive IPC re‑allocation. "
-             "ipc_c = base * (1 + beta * (1 - acc_c)). (default: 0.5)",
-    )
-    parser.add_argument(
-        "--adaptive-ipc-min-fraction", type=float, default=0.5,
-        help="Minimum fraction of base IPC that any class can receive. (default: 0.5)",
     )
 
     parser.add_argument("--teacher-backbone", type=str, default="resnet18", choices=["resnet18", "resnet50"])
