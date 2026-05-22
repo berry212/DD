@@ -38,7 +38,6 @@ for DATASET in "${DATASETS[@]}"; do
         IPC="$IPC" \
         WEIGHTING_STRATEGY="$WEIGHT" \
         DISTILL_METHOD="clvq" \
-        MODEL_TYPE="sd" \
         OUTPUT_DIR="$DISTILL_OUT" \
         DATA_ROOT="data" \
         bash "$SCRIPT_DIR/distillate.sh"

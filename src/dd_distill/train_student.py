@@ -111,20 +111,21 @@ def build_eval_loaders(
     eval_batch_size: int,
     num_workers: int,
     device: torch.device,
+    pin_memory: bool,
 ) -> tuple[DataLoader[tuple[torch.Tensor, torch.Tensor]], DataLoader[tuple[torch.Tensor, torch.Tensor]]]:
     val_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
         TorchDataset(val_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=pin_memory,
     )
     test_loader: DataLoader[tuple[torch.Tensor, torch.Tensor]] = DataLoader(
         TorchDataset(test_set, transform=eval_transform),
         batch_size=eval_batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=pin_memory,
     )
     return val_loader, test_loader
 
@@ -259,13 +260,88 @@ def load_fkd_batch_payload(distilled_data_path: Path, fkd_batch_path: str) -> di
     return payload
 
 
+class DistilledFKDImageAccessor:
+    """FKD->distilled images-> single flat float32 cache, without storage views."""
+
+    def __init__(self, distilled_data_path: Path, bundle: DistilledDataBundle, *, pin_memory: bool = False) -> None:
+        self.num_samples = int(bundle.num_samples)
+
+        if bundle.images is not None:
+            self._flat = bundle.images
+        elif bundle.image_shards:
+            self._flat = self._load_all_shards(distilled_data_path, bundle.image_shards)
+        else:
+            raise ValueError(
+                "FKD mode requires PT-backed distilled images. "
+                "Missing 'images' and 'image_shards' in distilled_data.pt."
+            )
+
+        # keep self._flat as a contiguous float32 CPU tensor, NOT a storage view
+        flat = self._flat.float()
+        if flat.device.type != "cpu":
+            flat = flat.cpu()
+        if flat.max().item() > 1.0 + 1e-6:
+            flat = flat / 255.0
+        flat = flat.clamp(0.0, 1.0).contiguous()
+
+        if flat.size(0) != self.num_samples:
+            raise ValueError(
+                f"FKD flat image count mismatch: expected={self.num_samples} got={flat.size(0)}"
+            )
+
+        if pin_memory:
+            flat = flat.pin_memory()
+        self._flat = flat
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def get_image(self, index: int) -> torch.Tensor:
+        idx = int(index)
+        if idx < 0 or idx >= self.num_samples:
+            raise IndexError(f"distilled image index out of range: {idx}")
+        return self._flat[idx]
+
+    @staticmethod
+    def _load_all_shards(distilled_data_path: Path, image_shards: list[str]) -> torch.Tensor:
+        chunks: list[torch.Tensor] = []
+        cursor = 0
+        for shard_rel in image_shards:
+            shard_abs = distilled_data_path.parent / shard_rel
+            sd = torch.load(shard_abs, map_location="cpu")
+            im = sd.get("images")
+            if not isinstance(im, torch.Tensor):
+                raise ValueError(f"Missing tensor 'images' in shard: {shard_abs}")
+            start = int(sd.get("start_index", cursor))
+            end = int(sd.get("end_index", start + im.size(0)))
+            if int(im.size(0)) != (end - start):
+                raise ValueError(f"Shard size mismatch: {shard_abs} start={start} end={end} sz={im.size(0)}")
+            if start != cursor:
+                raise ValueError(f"Non-contiguous shard: {shard_abs} expected cursor={cursor} got start={start}")
+            im = im.float()
+            if im.device.type != "cpu":
+                im = im.cpu()
+            chunks.append(im)
+            cursor = end
+        if not chunks:
+            raise ValueError("No shards loaded for FKD eager path.")
+        return torch.cat(chunks, dim=0)
+
+
 class DistilledImageAccessor:
-    def __init__(self, distilled_data_path: Path, bundle: DistilledDataBundle) -> None:
+    def __init__(
+        self,
+        distilled_data_path: Path,
+        bundle: DistilledDataBundle,
+        require_pt_images: bool = False,
+        detach_storage: bool = False,
+    ) -> None:
         self.distilled_data_path = distilled_data_path
         self.images = bundle.images
         self.image_relative_paths = list(bundle.image_relative_paths)
         self.image_shards = list(bundle.image_shards)
         self.num_samples = int(bundle.num_samples)
+        self.detach_storage = bool(detach_storage)
 
         self._cached_shard_rel = ""
         self._cached_shard_start = -1
@@ -282,10 +358,18 @@ class DistilledImageAccessor:
             raise IndexError(f"distilled image index out of range: {idx}")
 
         if self.images is not None:
-            return self.images[idx].float().cpu()
+            image = self.images[idx]
+            if image.dtype != torch.float32:
+                image = image.float()
+            if image.device.type != "cpu":
+                image = image.cpu()
+            return image.clone() if self.detach_storage else image
+        if self.image_shards:
+            image = self._load_image_from_shard(idx)
+            return image.clone() if self.detach_storage else image
         if self.image_relative_paths:
             return self._load_image_from_relative_path(self.image_relative_paths[idx])
-        return self._load_image_from_shard(idx)
+        raise ValueError("No distilled image sources available.")
 
     def _resolve_relative_path(self, rel_path: str) -> Path:
         rel_str = str(rel_path)
@@ -353,7 +437,7 @@ class DistilledImageAccessor:
             self._cached_shard_images = shard_t.clamp(0.0, 1.0).cpu()
 
         local_index = index - self._cached_shard_start
-        return self._cached_shard_images[local_index].float().cpu()
+        return self._cached_shard_images[local_index]
 
 
 class LazyDistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
@@ -385,7 +469,7 @@ class LazyDistilledTripletDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torc
 class DistilledTTMBatchDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]):
     def __init__(
         self,
-        image_accessor: DistilledImageAccessor,
+        image_accessor: DistilledImageAccessor | DistilledFKDImageAccessor,
         weights: torch.Tensor,
         batch_indices: torch.Tensor,
         crop_params: torch.Tensor,
@@ -710,6 +794,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     set_global_seed(args.seed)
     device = resolve_device(args.device)
     amp_enabled = bool(args.amp and device.type == "cuda")
+    pin_memory = bool(args.pin_memory and device.type == "cuda")
     dataset_spec = get_dataset_spec(args.dataset)
     output_dir = Path(args.output_dir or f"outputs/{dataset_spec.name}_224_student")
     distilled_data_path = Path(args.distilled_data or f"outputs/{dataset_spec.name}_224_distill/distilled_data.pt")
@@ -726,7 +811,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     val_set = split_bundle.val_set
     test_set = split_bundle.test_set
     num_classes = split_bundle.num_classes
-    class_name_map = split_bundle.class_names
+    class_name_map = split_bundle.label_table
     class_names = [class_name_map.get(idx, f"class_{idx}") for idx in range(num_classes)]
     distilled_bundle = load_distilled_triplet(distilled_data_path)
     num_distilled = int(distilled_bundle.num_samples)
@@ -734,7 +819,21 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     soft_labels = distilled_bundle.soft_labels
     distilled_dataset = distilled_bundle.dataset
     distilled_lora_path = distilled_bundle.lora_path
-    image_accessor = DistilledImageAccessor(distilled_data_path, distilled_bundle)
+    use_fkd = bool(args.use_fkd_batches and distilled_bundle.fkd_batch_path)
+    #  non-FKD always uses the generic accessor
+    image_accessor = DistilledImageAccessor(
+        distilled_data_path,
+        distilled_bundle,
+        require_pt_images=False,
+        detach_storage=False,
+    )
+    # FKD gets its own flat-memory accessor
+    if use_fkd:
+        fkd_image_accessor = DistilledFKDImageAccessor(
+            distilled_data_path, distilled_bundle, pin_memory=pin_memory
+        )
+    else:
+        fkd_image_accessor = None
 
     pseudo_labels = torch.argmax(soft_labels, dim=1).long()
     weights = blend_sample_weights(
@@ -762,6 +861,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         eval_batch_size=args.eval_batch_size,
         num_workers=args.num_workers,
         device=device,
+        pin_memory=pin_memory,
     )
 
     train_mode = "samplewise"
@@ -801,7 +901,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         train_set = DistilledTTMBatchDataset(
-            image_accessor=image_accessor,
+            image_accessor=fkd_image_accessor,
             weights=weights,
             batch_indices=fkd_payload["indices"][:fkd_batches_used],
             crop_params=fkd_payload["crop_params"][:fkd_batches_used],
@@ -815,7 +915,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             batch_size=1,
             shuffle=False,
             num_workers=0,
-            pin_memory=False,
+            pin_memory=pin_memory,
             collate_fn=unwrap_single_batch,
         )
         train_mode = "fkd_batches"
@@ -849,7 +949,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             batch_size=effective_train_batch_size,
             shuffle=True,
             num_workers=args.num_workers,
-            pin_memory=False,
+            pin_memory=pin_memory,
         )
 
     model = build_classifier(
@@ -971,6 +1071,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imagenet-pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=42)
     return parser

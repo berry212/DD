@@ -90,7 +90,7 @@ def main() -> None:
     )
     train_set = split_bundle.train_set
     num_classes = split_bundle.num_classes
-    class_name_map = split_bundle.class_names
+    class_name_map = split_bundle.label_table
     class_names = [class_name_map.get(i, f"class_{i}") for i in range(num_classes)]
 
     print(f"[Dataset] name={dataset_spec.name} samples={len(train_set)} classes={num_classes}")

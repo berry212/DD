@@ -98,24 +98,13 @@ def default_data_root() -> str:
 
 
 def resolve_lora_path(dataset_name: str, lora_path_arg: str) -> str:
-    explicit = lora_path_arg.strip()
-    if explicit:
-        return explicit
-
-    dataset_default = Path("outputs") / f"lora_{dataset_name}"
-    if dataset_default.exists():
-        return str(dataset_default)
-
-    legacy_default = Path("outputs/lora_dreammnist")
-    if dataset_name == "dermamnist" and legacy_default.exists():
-        warnings.warn(
-            "Using legacy LoRA path outputs/lora_dreammnist for dermamnist. "
-            "Consider migrating to outputs/lora_dermamnist.",
-            RuntimeWarning,
-        )
-        return str(legacy_default)
-
-    return str(dataset_default)
+    lora_path = lora_path_arg.strip()
+    if lora_path:
+        return lora_path
+    default_lora_path = Path("outputs") / f"lora_{dataset_name}"
+    if default_lora_path.exists():
+        return str(default_lora_path)
+    RuntimeError(f"Lora Path Not Exist: {lora_path} or {default_lora_path}")
 
 
 def set_global_seed(seed: int) -> None:
@@ -280,58 +269,12 @@ def load_latent_cache(
     expected_vae_model_id: str,
     expected_image_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
-    if not cache_path.exists():
-        return None
+    payload = torch.load(cache_path, map_location="cpu")
 
-    try:
-        payload = torch.load(cache_path, map_location="cpu")
-    except Exception as exc:
-        warnings.warn(f"Failed to load latent cache ({cache_path}): {exc}", RuntimeWarning)
-        return None
-
-    if not isinstance(payload, dict):
-        warnings.warn(f"Latent cache format invalid: {cache_path}", RuntimeWarning)
-        return None
-
-    cached_dataset = payload.get("dataset")
-    if cached_dataset is not None and str(cached_dataset) != str(expected_dataset):
-        warnings.warn(
-            f"Latent cache dataset mismatch ({cached_dataset} != {expected_dataset}), re-encoding.",
-            RuntimeWarning,
-        )
-        return None
-
-    cached_model_id = payload.get("vae_model_id")
-    if cached_model_id is not None and str(cached_model_id) != str(expected_vae_model_id):
-        warnings.warn(
-            f"Latent cache VAE mismatch ({cached_model_id} != {expected_vae_model_id}), re-encoding.",
-            RuntimeWarning,
-        )
-        return None
-
-    cached_image_size = payload.get("image_size")
-    if cached_image_size is not None and int(cached_image_size) != int(expected_image_size):
-        warnings.warn(
-            f"Latent cache image size mismatch ({cached_image_size} != {expected_image_size}), re-encoding.",
-            RuntimeWarning,
-        )
-        return None
-
-    latents = payload.get("latents")
-    labels = payload.get("labels")
-    if not isinstance(latents, torch.Tensor) or not isinstance(labels, torch.Tensor):
-        warnings.warn(f"Latent cache missing tensor fields: {cache_path}", RuntimeWarning)
-        return None
-
+    latents = payload['latents']
+    labels = payload['labels']
     latents = latents.float().cpu()
     labels = labels.long().view(-1).cpu()
-    if latents.size(0) != expected_num_samples or labels.size(0) != expected_num_samples:
-        warnings.warn(
-            f"Latent cache sample count mismatch ({latents.size(0)}/{labels.size(0)} != {expected_num_samples}), "
-            "re-encoding.",
-            RuntimeWarning,
-        )
-        return None
 
     print(f"[Encoding] Loaded latent cache: {cache_path}")
     return latents, labels

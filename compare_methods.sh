@@ -136,7 +136,6 @@ for DATASET in ${DATASETS[*]}; do
           IPC="$IPC" \
           DISTILL_METHOD="$METHOD" \
           WEIGHTING_STRATEGY="$WEIGHTING_STRATEGY" \
-          MODEL_TYPE="sd" \
           OUTPUT_DIR="$DISTILL_OUT" \
           DATA_ROOT="$DATA_ROOT" \
           bash "$SCRIPT_DIR/distillate.sh"

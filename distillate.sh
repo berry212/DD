@@ -21,18 +21,11 @@ GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.0}"
 SDE_STEPS="${SDE_STEPS:-200}"
 SDE_NOISE_STRENGTH="${SDE_NOISE_STRENGTH:-0.2}"
 WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-inverse}"
-MODEL_TYPE="${MODEL_TYPE:-sd}"
 WEIGHT_SMOOTH="${WEIGHT_SMOOTH:-0.5}"
 MODE_GUIDANCE_LAMBDA="${MODE_GUIDANCE_LAMBDA:-0.0}"
 MODE_GUIDANCE_T_STOP="${MODE_GUIDANCE_T_STOP:-80}"
 
-if [[ "$MODEL_TYPE" == "dit" ]]; then
-  DIFFUSION_MODEL_ID="facebook/DiT-XL-2-256"
-  MODEL_ARGS=(--model-type dit)
-else
-  DIFFUSION_MODEL_ID="runwayml/stable-diffusion-v1-5"
-  MODEL_ARGS=()
-fi
+DIFFUSION_MODEL_ID="runwayml/stable-diffusion-v1-5"
 
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-50}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
@@ -98,7 +91,6 @@ uv run run-distillation \
   --teacher-baseline-dir "$BASELINE_DIR" \
   --vae-model-id stabilityai/sd-vae-ft-mse \
   --diffusion-model-id "$DIFFUSION_MODEL_ID" \
-  "${MODEL_ARGS[@]}" \
   --lora-path "$LORA_PATH" \
   --lora-scale 0.9 \
   --guidance-scale "$GUIDANCE_SCALE" \
@@ -112,7 +104,6 @@ uv run run-distillation \
   --teacher-backbone "$TEACHER_BACKBONE" \
   --teacher-epochs "$TEACHER_EPOCHS" \
   --teacher-temperature "$TEACHER_TEMPERATURE" \
-  --no-auto-train-teacher-baseline \
   --sde-steps "$SDE_STEPS" \
   --sde-noise-strength "$SDE_NOISE_STRENGTH" \
   --mode-guidance-lambda "$MODE_GUIDANCE_LAMBDA" \
