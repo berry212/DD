@@ -2,10 +2,9 @@
 # ============================================================================
 # 消融实验：LoRA 微调 × 全局聚类 × 软标签
 #
-# 配置 A: 无 LoRA + 逐类聚类 + 硬标签
-# 配置 B:   LoRA + 逐类聚类 + 硬标签
-# 配置 C:   LoRA + 全局聚类 + 硬标签
-# 配置 D:   LoRA + 全局聚类 + 软标签
+# 配置 A: LoRA + 逐类聚类 + 硬标签
+# 配置 B: LoRA + 全局聚类 + 硬标签
+# 配置 C: LoRA + 全局聚类 + 软标签
 #
 # 用法：
 #   bash ablation.sh                              # 默认 dermamnist
@@ -57,59 +56,10 @@ echo "config,lora,global_cluster,soft_label,ipc,test_acc,best_val_acc,test_auc_m
 
 for IPC in $IPC_LIST; do
 
-  # ── 配置 A: 无 LoRA, 逐类聚类, 硬标签 ──
+  # ── 配置 A (原 B): LoRA + 逐类聚类 + 硬标签 ──
   CONFIG="A"
-  DISTILL_SUFFIX="_A_nolora_classwise_hard"
-  STUDENT_SUFFIX="_A_nolora_classwise_hard"
-  DISTILL_DIR="outputs/${DATASET}_224_distill_ipc${IPC}${DISTILL_SUFFIX}"
-  STUDENT_DIR="outputs/${DATASET}_224_student_ipc${IPC}${STUDENT_SUFFIX}"
-
-  echo ""
-  echo "===== Config ${CONFIG}: no-LoRA + classwise + hard label | IPC=${IPC} ====="
-
-  if [[ ! -f "${DISTILL_DIR}/distilled_data.pt" ]]; then
-    uv run run-distillation \
-      --dataset "$DATASET" --data-root "$DATA_ROOT" --output-dir "$DISTILL_DIR" \
-      --teacher-baseline-dir "$BASELINE_DIR" \
-      --vae-model-id stabilityai/sd-vae-ft-mse \
-      --diffusion-model-id runwayml/stable-diffusion-v1-5 \
-      --lora-path "" \
-      --clusters-per-class "$IPC" --distill-method "$DISTILL_METHOD" \
-      --no-use-global-cluster \
-      --weighting-strategy "$WEIGHTING_STRATEGY" --weight-smooth 0.0 \
-      --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
-      --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
-      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
-      --mode-guidance-lambda 0.0 \
-      --encode-batch-size 32 --decode-batch-size 32 \
-      --no-fkd-precompute-batches --fp16 --num-workers 4
-  else
-    echo "[Distill] Already exists, skip: $DISTILL_DIR"
-  fi
-
-  uv run run-train-distilled-student \
-    --dataset "$DATASET" --data-root "$DATA_ROOT" \
-    --distilled-data "${DISTILL_DIR}/distilled_data.pt" --output-dir "$STUDENT_DIR" \
-    --student-backbone "$TEACHER_BACKBONE" \
-    --train-epochs "$STUDENT_EPOCHS" --train-batch-size "$STUDENT_BATCH_SIZE" \
-    --eval-batch-size "$EVAL_BATCH_SIZE" --train-lr "$STUDENT_LR" \
-    --weight-decay 1e-4 --kd-temperature "$KD_TEMPERATURE" \
-    --hard-label-alpha 1.0 --weight-balance-alpha 0.0 --soft-label-sharpen 1.0 \
-    --train-crop-min-scale 0.08 --train-crop-max-scale 1.0 --train-horizontal-flip-prob 0.5 \
-    --no-use-fkd-batches --amp --num-workers 4
-
-  SUMMARY_JSON="${STUDENT_DIR}/summary.json"
-  TEST_ACC=$(python3 -c "import json; print(json.load(open('$SUMMARY_JSON'))['test_acc_at_best_val'])")
-  BEST_VAL=$(python3 -c "import json; print(json.load(open('$SUMMARY_JSON'))['best_val_acc'])")
-  AUC=$(python3 -c "import json; d=json.load(open('$SUMMARY_JSON')); print(d.get('auc_macro','nan'))")
-  N_DIST=$(python3 -c "import json; print(json.load(open('$SUMMARY_JSON'))['num_distilled'])")
-  echo "$CONFIG,no,classwise,no,$IPC,$TEST_ACC,$BEST_VAL,$AUC,$N_DIST" >> "$SUMMARY_CSV"
-  echo "  Result: test_acc=$TEST_ACC  best_val=$BEST_VAL  auc=$AUC"
-
-  # ── 配置 B: LoRA, 逐类聚类, 硬标签 ──
-  CONFIG="B"
-  DISTILL_SUFFIX="_B_lora_classwise_hard"
-  STUDENT_SUFFIX="_B_lora_classwise_hard"
+  DISTILL_SUFFIX="_A_lora_classwise_hard"
+  STUDENT_SUFFIX="_A_lora_classwise_hard"
   DISTILL_DIR="outputs/${DATASET}_224_distill_ipc${IPC}${DISTILL_SUFFIX}"
   STUDENT_DIR="outputs/${DATASET}_224_student_ipc${IPC}${STUDENT_SUFFIX}"
 
@@ -128,10 +78,10 @@ for IPC in $IPC_LIST; do
       --weighting-strategy "$WEIGHTING_STRATEGY" --weight-smooth 0.0 \
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
-      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
+      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 0.0 \
       --mode-guidance-lambda 0.0 \
       --encode-batch-size 32 --decode-batch-size 32 \
-      --no-fkd-precompute-batches --fp16 --num-workers 4
+      --fkd-precompute-batches --fp16 --num-workers 4
   else
     echo "[Distill] Already exists, skip: $DISTILL_DIR"
   fi
@@ -145,7 +95,7 @@ for IPC in $IPC_LIST; do
     --weight-decay 1e-4 --kd-temperature "$KD_TEMPERATURE" \
     --hard-label-alpha 1.0 --weight-balance-alpha 0.0 --soft-label-sharpen 1.0 \
     --train-crop-min-scale 0.08 --train-crop-max-scale 1.0 --train-horizontal-flip-prob 0.5 \
-    --no-use-fkd-batches --amp --num-workers 4
+    --use-fkd-batches --amp --num-workers 4
 
   SUMMARY_JSON="${STUDENT_DIR}/summary.json"
   TEST_ACC=$(python3 -c "import json; print(json.load(open('$SUMMARY_JSON'))['test_acc_at_best_val'])")
@@ -155,10 +105,10 @@ for IPC in $IPC_LIST; do
   echo "$CONFIG,yes,classwise,no,$IPC,$TEST_ACC,$BEST_VAL,$AUC,$N_DIST" >> "$SUMMARY_CSV"
   echo "  Result: test_acc=$TEST_ACC  best_val=$BEST_VAL  auc=$AUC"
 
-  # ── 配置 C: LoRA, 全局聚类, 硬标签 ──
-  CONFIG="C"
-  DISTILL_SUFFIX="_C_lora_global_hard"
-  STUDENT_SUFFIX="_C_lora_global_hard"
+  # ── 配置 B (原 C): LoRA + 全局聚类 + 硬标签 ──
+  CONFIG="B"
+  DISTILL_SUFFIX="_B_lora_global_hard"
+  STUDENT_SUFFIX="_B_lora_global_hard"
   DISTILL_DIR="outputs/${DATASET}_224_distill_ipc${IPC}${DISTILL_SUFFIX}"
   STUDENT_DIR="outputs/${DATASET}_224_student_ipc${IPC}${STUDENT_SUFFIX}"
 
@@ -177,10 +127,10 @@ for IPC in $IPC_LIST; do
       --weighting-strategy "$WEIGHTING_STRATEGY" --weight-smooth 0.0 \
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
-      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
+      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 0.0 \
       --mode-guidance-lambda 0.0 \
       --encode-batch-size 32 --decode-batch-size 32 \
-      --no-fkd-precompute-batches --fp16 --num-workers 4
+      --fkd-precompute-batches --fp16 --num-workers 4
   else
     echo "[Distill] Already exists, skip: $DISTILL_DIR"
   fi
@@ -194,7 +144,7 @@ for IPC in $IPC_LIST; do
     --weight-decay 1e-4 --kd-temperature "$KD_TEMPERATURE" \
     --hard-label-alpha 1.0 --weight-balance-alpha 0.0 --soft-label-sharpen 1.0 \
     --train-crop-min-scale 0.08 --train-crop-max-scale 1.0 --train-horizontal-flip-prob 0.5 \
-    --no-use-fkd-batches --amp --num-workers 4
+    --use-fkd-batches --amp --num-workers 4
 
   SUMMARY_JSON="${STUDENT_DIR}/summary.json"
   TEST_ACC=$(python3 -c "import json; print(json.load(open('$SUMMARY_JSON'))['test_acc_at_best_val'])")
@@ -204,10 +154,10 @@ for IPC in $IPC_LIST; do
   echo "$CONFIG,yes,global,no,$IPC,$TEST_ACC,$BEST_VAL,$AUC,$N_DIST" >> "$SUMMARY_CSV"
   echo "  Result: test_acc=$TEST_ACC  best_val=$BEST_VAL  auc=$AUC"
 
-  # ── 配置 D: LoRA, 全局聚类, 软标签 ──
-  CONFIG="D"
-  DISTILL_SUFFIX="_D_lora_global_soft"
-  STUDENT_SUFFIX="_D_lora_global_soft"
+  # ── 配置 C (原 D): LoRA + 全局聚类 + 软标签 ──
+  CONFIG="C"
+  DISTILL_SUFFIX="_C_lora_global_soft"
+  STUDENT_SUFFIX="_C_lora_global_soft"
   DISTILL_DIR="outputs/${DATASET}_224_distill_ipc${IPC}${DISTILL_SUFFIX}"
   STUDENT_DIR="outputs/${DATASET}_224_student_ipc${IPC}${STUDENT_SUFFIX}"
 
@@ -226,10 +176,10 @@ for IPC in $IPC_LIST; do
       --weighting-strategy "$WEIGHTING_STRATEGY" --weight-smooth 0.0 \
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
-      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
+      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 0.0 \
       --mode-guidance-lambda 0.0 \
       --encode-batch-size 32 --decode-batch-size 32 \
-      --no-fkd-precompute-batches --fp16 --num-workers 4
+      --fkd-precompute-batches --fp16 --num-workers 4
   else
     echo "[Distill] Already exists, skip: $DISTILL_DIR"
   fi
@@ -243,7 +193,7 @@ for IPC in $IPC_LIST; do
     --weight-decay 1e-4 --kd-temperature "$KD_TEMPERATURE" \
     --hard-label-alpha 0.0 --weight-balance-alpha 0.0 --soft-label-sharpen 1.0 \
     --train-crop-min-scale 0.08 --train-crop-max-scale 1.0 --train-horizontal-flip-prob 0.5 \
-    --no-use-fkd-batches --amp --num-workers 4
+    --use-fkd-batches --amp --num-workers 4
 
   SUMMARY_JSON="${STUDENT_DIR}/summary.json"
   TEST_ACC=$(python3 -c "import json; print(json.load(open('$SUMMARY_JSON'))['test_acc_at_best_val'])")

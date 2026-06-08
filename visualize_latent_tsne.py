@@ -48,10 +48,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vae-model-id", type=str, default="stabilityai/sd-vae-ft-mse")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--encode-batch-size", type=int, default=64)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=5000,
                         help="降维最大样本数（t-SNE O(N²) 复杂度），0=不限制")
-    parser.add_argument("--per-class-samples", type=int, default=0,
+    parser.add_argument("--per-class-samples", type=int, default=50,
                         help="每类别抽样数（0=不使用，>0时按类别分层抽样，优先于--max-samples）")
     parser.add_argument("--perplexity", type=float, default=30.0)
     parser.add_argument("--tsne-iter", type=int, default=2000)
@@ -230,22 +230,15 @@ def main() -> None:
                 alpha=args.alpha,
                 edgecolors="none",
             )
-
-    title_class = f"class {args.target_class} ({target_class_name})" if args.target_class >= 0 else "all classes"
-    ax.set_title(
-        f"{dataset_spec.name} — VAE Latent Space t-SNE ({title_class})\n"
-        f"(n={X.shape[0]}, perplexity={args.perplexity}, "
-        f"latent_dim={latent_dim}, metric={args.metric})",
-        fontsize=14,
-    )
-    ax.set_xlabel("t-SNE dim 1")
-    ax.set_ylabel("t-SNE dim 2")
+    
+    ax.set_title(dataset_spec.name, fontsize=14)
     ax.legend(
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
-        fontsize=9,
-        markerscale=1.5,
+        loc="best",
+        fontsize=7,
+        markerscale=1.2,
         frameon=True,
+        framealpha=0.8,
+        ncol=1,
     )
     fig.tight_layout()
 

@@ -43,13 +43,9 @@ from dd_distill.baseline_resnet18 import (
 )
 from dd_distill.datasets import TorchDataset, get_dataset_spec
 from dd_distill.train_student import (
-    DistilledImageAccessor,
-    LazyDistilledTripletDataset,
     load_distilled_triplet,
-    build_classifier as build_student_classifier,
-    build_eval_transform,
-    build_train_transform,
-    blend_sample_weights,
+    load_fkd_batch_payload,
+    run_training,
 )
 
 plt.rcParams["font.sans-serif"]=["SimHei"]
@@ -66,7 +62,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=str, default="outputs/training_time_comparison")
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--baseline-batch-size", type=int, default=128)
     p.add_argument("--student-batch-size", type=int, default=32)
     p.add_argument("--eval-batch-size", type=int, default=128)
     p.add_argument("--num-workers", type=int, default=4)
@@ -123,7 +118,7 @@ def train_baseline(args: argparse.Namespace, device: torch.device) -> dict[str, 
 
     train_loader = DataLoader(
         TorchDataset(splits.train_set, transform=train_transform),
-        batch_size=args.baseline_batch_size, shuffle=True,
+        batch_size=args.student_batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
@@ -185,7 +180,7 @@ def train_baseline(args: argparse.Namespace, device: torch.device) -> dict[str, 
         "total_time_s": round(total_time, 2),
         "peak_gpu_memory_mb": round(peak_memory, 1),
         "test_acc": round(test_acc, 6), "test_loss": round(test_loss, 6),
-        "batch_size": args.baseline_batch_size,
+        "batch_size": args.student_batch_size,
     }
     print(f"\n   ✅ 完成: {total_time:.1f}s  test_acc={test_acc:.4f}  mem={peak_memory:.0f}MB")
     return result
@@ -203,98 +198,63 @@ def train_on_distilled(
     print(f"  🟠 蒸馏数据训练  IPC={ipc}  (Ours / CLVQ, 软标签 KD)")
     print(f"  {'─' * 50}")
 
-    spec = get_dataset_spec(args.dataset)
-    splits = spec.load_dataset_splits(args.data_root, 224)
-    num_classes = splits.num_classes
-
+    distilled_data_path = distilled_data_path.resolve()
     bundle = load_distilled_triplet(distilled_data_path)
-    image_accessor = DistilledImageAccessor(distilled_data_path, bundle)
     num_distilled = bundle.num_samples
-    weights = blend_sample_weights(
-        bundle.weights, torch.argmax(bundle.soft_labels, dim=1).long(),
-        num_classes, balance_alpha=0.0,
+
+    # 构造与 train_student.sh 一致的参数
+    student_args = argparse.Namespace(
+        dataset=args.dataset,
+        data_root=args.data_root,
+        distilled_data=str(distilled_data_path),
+        output_dir=f"{args.output_dir}/student_ipc{ipc}",
+        student_backbone="resnet18",
+        train_epochs=args.epochs,
+        train_batch_size=args.student_batch_size,
+        eval_batch_size=args.eval_batch_size,
+        train_lr=4e-4,
+        weight_decay=1e-4,
+        kd_temperature=0,            # 0 = 自动从蒸馏数据解析 teacher_temperature（为 20.0）
+        weight_balance_alpha=0.0,
+        soft_label_sharpen=1.0,
+        hard_label_alpha=0.0,
+        train_crop_min_scale=0.08,
+        train_crop_max_scale=1.0,
+        train_horizontal_flip_prob=0.5,
+        use_fkd_batches=True,        # 使用 FKD 预计算批次
+        image_size=224,
+        imagenet_pretrained=True,
+        amp=True,
+        num_workers=args.num_workers,
+        pin_memory=False,
+        device="auto",
+        seed=args.seed,
     )
 
-    eval_transform = build_eval_transform(224, "resnet18")
-    val_loader = DataLoader(
-        TorchDataset(splits.val_set, transform=eval_transform),
-        batch_size=args.eval_batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=False,
-    )
-    test_loader = DataLoader(
-        TorchDataset(splits.test_set, transform=eval_transform),
-        batch_size=args.eval_batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=False,
-    )
-
-    train_transform = build_train_transform(224, "resnet18", 0.08, 1.0, 0.5)
-    train_set = LazyDistilledTripletDataset(
-        image_accessor=image_accessor, weights=weights, soft_labels=bundle.soft_labels,
-        transform=train_transform, use_hard_label=False,
-    )
-    eff_bs = min(args.student_batch_size, num_distilled)
-    train_loader = DataLoader(
-        train_set, batch_size=eff_bs, shuffle=True,
-        num_workers=args.num_workers, pin_memory=False,
-    )
-
-    model = build_student_classifier(num_classes, imagenet_pretrained=True, backbone="resnet18").to(device)
-    optimizer = AdamW(model.parameters(), lr=4e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    amp_enabled = device.type == "cuda"
-
-    reset_memory_stats()
+    # 预加载 FKD cache 使其进入 page cache，不计入训练时间
+    if bundle.fkd_batch_path:
+        _ = load_fkd_batch_payload(distilled_data_path, bundle.fkd_batch_path)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
+    reset_memory_stats()
     t_start = time.perf_counter()
-    best_val_acc = -1.0
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        correct, total = 0, 0
-        for images, soft, sw in train_loader:
-            images = images.to(device)
-            soft = soft.to(device=device, dtype=torch.float32)
-            sw = sw.to(device=device, dtype=torch.float32)
-
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-                logits = model(images)
-                log_probs = F.log_softmax(logits.float() / 20.0, dim=1)
-                per_sample = -(soft * log_probs).sum(dim=1)
-                loss = (per_sample * sw).sum() / max(images.size(0), 1) * 400.0
-            loss.backward()
-            optimizer.step()
-
-            pseudo = soft.argmax(dim=1)
-            correct += (logits.argmax(dim=1) == pseudo).sum().item()
-            total += images.size(0)
-
-        scheduler.step()
-        train_acc = correct / total
-        val_loss, val_acc = evaluate_classifier(model, val_loader, device, amp_enabled)
-        test_loss, test_acc = evaluate_classifier(model, test_loader, device, amp_enabled)
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-        print(f"      epoch {epoch:3d}/{args.epochs}  train_acc={train_acc:.4f}  val_acc={val_acc:.4f}  test_acc={test_acc:.4f}")
-
+    summary = run_training(student_args)
     if device.type == "cuda":
         torch.cuda.synchronize()
     total_time = time.perf_counter() - t_start
     peak_memory = get_gpu_memory_mb()
-
-    test_loss, test_acc = evaluate_classifier(model, test_loader, device, amp_enabled)
 
     result = {
         "mode": "Ours", "ipc": ipc,
         "num_distilled": num_distilled, "num_epochs": args.epochs,
         "total_time_s": round(total_time, 2),
         "peak_gpu_memory_mb": round(peak_memory, 1),
-        "test_acc": round(test_acc, 6), "test_loss": round(test_loss, 6),
-        "batch_size": eff_bs,
+        "test_acc": round(summary["test_acc_at_best_val"], 6),
+        "test_loss": round(summary["test_loss_at_best_val"], 6),
+        "batch_size": summary.get("train_batch_size", args.student_batch_size),
     }
-    print(f"     ✅ IPC={ipc}: {total_time:.1f}s  test_acc={test_acc:.4f}  mem={peak_memory:.0f}MB")
+    print(f"     ✅ IPC={ipc}: {total_time:.1f}s  test_acc={result['test_acc']:.4f}  mem={peak_memory:.0f}MB")
     return result
 
 
@@ -442,7 +402,7 @@ def main():
     device = resolve_device(args.device)
 
     print(f"📌 设备: {device}  |  数据集: {args.dataset}  |  Epochs: {args.epochs}")
-    print(f"    Baseline batch: {args.baseline_batch_size}  |  Student batch: {args.student_batch_size}")
+    print(f"    Batch size: {args.student_batch_size}  (Baseline & Student 统一)")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -475,7 +435,7 @@ def main():
             "num_train": len(splits.train_set), "num_epochs": args.epochs,
             "total_time_s": 0, "peak_gpu_memory_mb": 0,
             "test_acc": round(test_acc, 6), "test_loss": round(test_loss, 6),
-            "batch_size": args.baseline_batch_size,
+            "batch_size": args.student_batch_size,
         }
         print(f"    使用缓存 baseline: test_acc={test_acc:.4f}")
     else:

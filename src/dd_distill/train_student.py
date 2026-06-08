@@ -693,11 +693,13 @@ def train_student(
     amp_enabled: bool,
     output_dir: Path,
     kd_temperature: float,
+    hard_label_alpha: float = 0.0,
 ) -> dict[str, Any]:
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(int(epochs), 1))
     scaler = torch.amp.GradScaler(device="cuda", enabled=amp_enabled)
 
+    alpha = float(np.clip(hard_label_alpha, 0.0, 1.0))
     best_val_acc = -1.0
     best_epoch = -1
     history: list[dict[str, float]] = []
@@ -718,10 +720,22 @@ def train_student(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
                 logits = model(images)
+
+                # Soft-label KD loss (KL div)
                 student_log_probs = F.log_softmax(logits.float() / temp, dim=1)
                 per_sample_ce = -(soft_labels * student_log_probs).sum(dim=1)
-                loss = (per_sample_ce * sample_weights).sum() / float(max(images.size(0), 1))
-                loss = loss * (temp * temp)
+                soft_loss = (per_sample_ce * sample_weights).sum() / float(max(images.size(0), 1))
+                soft_loss = soft_loss * (temp * temp)
+
+                # Hard-label CE loss (using argmax of soft_labels as pseudo ground truth)
+                if alpha > 0.0:
+                    hard_targets = soft_labels.argmax(dim=1)
+                    hard_loss = F.cross_entropy(logits, hard_targets, reduction="none")
+                    hard_loss = (hard_loss * sample_weights).sum() / float(max(images.size(0), 1))
+                else:
+                    hard_loss = torch.tensor(0.0, device=device)
+
+                loss = (1.0 - alpha) * soft_loss + alpha * hard_loss
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -972,6 +986,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         amp_enabled=amp_enabled,
         output_dir=output_dir,
         kd_temperature=resolved_kd_temperature,
+        hard_label_alpha=args.hard_label_alpha,
     )
 
     best_ckpt = torch.load(output_dir / "student_best.pt", map_location=device)
@@ -1022,6 +1037,7 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "distilled_teacher_temperature": float(distilled_bundle.teacher_temperature),
         "weight_balance_alpha": float(args.weight_balance_alpha),
         "soft_label_sharpen": float(args.soft_label_sharpen),
+        "hard_label_alpha": float(args.hard_label_alpha),
         "best_epoch": int(training_summary["best_epoch"]),
         "best_val_acc": float(training_summary["best_val_acc"]),
         "test_acc_at_best_val": float(training_summary["test_acc_at_best_val"]),
@@ -1062,6 +1078,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kd-temperature", type=float, default=0.0)
     parser.add_argument("--weight-balance-alpha", type=float, default=0.0)
     parser.add_argument("--soft-label-sharpen", type=float, default=1.0)
+    parser.add_argument("--hard-label-alpha", type=float, default=0.0,
+                        help="Interpolation between soft (0.0) and hard (1.0) label loss. "
+                             "loss = (1-alpha)*KD_loss + alpha*CE_loss.")
     parser.add_argument("--train-crop-min-scale", type=float, default=0.08)
     parser.add_argument("--train-crop-max-scale", type=float, default=1.0)
     parser.add_argument("--train-horizontal-flip-prob", type=float, default=0.5)

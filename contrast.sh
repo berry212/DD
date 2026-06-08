@@ -2,10 +2,10 @@
 # ============================================================================
 # 方法对比实验：D4M / MGD³ / DDOQ / Ours
 #
-# D4M:   guidance=off, uniform, hard label, classwise cluster (baseline)
+# D4M:   guidance=off, uniform, soft label, classwise cluster (baseline)
 # MGD³:  guidance=on,  uniform, soft label, classwise cluster
 # DDOQ:  guidance=off, heuristic,soft label, classwise cluster
-# Ours:  guidance=off, uniform, soft label, global cluster
+# Ours:  guidance=off, uniform, soft label, classwise cluster
 #
 # 用法：
 #   bash contrast.sh                               # 默认 dermamnist IPC=100
@@ -24,7 +24,7 @@ IPC_LIST="${IPC:-10 50 100 200}"
 
 TEACHER_BACKBONE="${TEACHER_BACKBONE:-resnet18}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
-STUDENT_EPOCHS="${STUDENT_EPOCHS:-20}"
+STUDENT_EPOCHS="${STUDENT_EPOCHS:-40}"
 STUDENT_BATCH_SIZE="${STUDENT_BATCH_SIZE:-32}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1024}"
 STUDENT_LR="${STUDENT_LR:-4e-4}"
@@ -54,9 +54,12 @@ run_method() {
   local IPC="$2"
   local LORA_FLAG="$3"        # --lora-path value or ""
   local GUIDANCE_LAMBDA="$4"
-  local WEIGHTING="$5"
-  local HARD_ALPHA="$6"
-  local GLOBAL_FLAG="$7"      # --use-global-cluster or --no-use-global-cluster
+  local GUIDANCE_SCALE="$5"   # classifier-free guidance scale (0=no text injection)
+  local WEIGHTING="$6"
+  local HARD_ALPHA="$7"
+  local GLOBAL_FLAG="$8"      # --use-global-cluster or --no-use-global-cluster
+  local FKD_FLAG="$9"         # --fkd-precompute-batches or --no-fkd-precompute-batches
+  local USE_FKD_FLAG="${10}"  # --use-fkd-batches or --no-use-fkd-batches
 
   local DISTILL_DIR="outputs/${DATASET}_224_distill_ipc${IPC}_contrast_${METHOD}"
   local STUDENT_DIR="outputs/${DATASET}_224_student_ipc${IPC}_contrast_${METHOD}"
@@ -76,10 +79,11 @@ run_method() {
       --weighting-strategy "$WEIGHTING" --weight-smooth 0.0 \
       --teacher-backbone "$TEACHER_BACKBONE" --teacher-epochs "$TEACHER_EPOCHS" \
       --teacher-temperature 20.0 --no-auto-train-teacher-baseline \
-      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale 3.0 \
+      --sde-steps 200 --sde-noise-strength 0.2 --guidance-scale "$GUIDANCE_SCALE" \
       --mode-guidance-lambda "$GUIDANCE_LAMBDA" --mode-guidance-t-stop 80 \
+      --clvq-batch-size 256 \
       --encode-batch-size 32 --decode-batch-size 32 \
-      --no-fkd-precompute-batches --fp16 --num-workers 4
+      $FKD_FLAG --fp16 --num-workers 4
   else
     echo "  [Distill] Already exists, skip: $DISTILL_DIR"
   fi
@@ -93,7 +97,7 @@ run_method() {
     --weight-decay 1e-4 --kd-temperature "$KD_TEMPERATURE" \
     --hard-label-alpha "$HARD_ALPHA" --weight-balance-alpha 0.0 --soft-label-sharpen 1.0 \
     --train-crop-min-scale 0.08 --train-crop-max-scale 1.0 --train-horizontal-flip-prob 0.5 \
-    --no-use-fkd-batches --amp --num-workers 4
+    $USE_FKD_FLAG --amp --num-workers 4
 
   # Print result
   local S="${STUDENT_DIR}/summary.json"
@@ -114,25 +118,33 @@ for IPC in $IPC_LIST; do
   echo "  IPC = $IPC"
   echo "############################################################"
 
-  # D4M: guidance=off, uniform, hard label (alpha=1.0), classwise
+#   D4M: guidance=off, uniform, hard label (alpha=1.0), classwise cluster
+#         classwise 聚类 + 无文本提示词注入 (guidance-scale=0, mode-guidance-lambda=0)
   run_method "D4M" "$IPC" \
     "--lora-path ${LORA_PATH} --lora-scale 0.9" \
-    "0.0" "uniform" "1.0" "--no-use-global-cluster"
+    "0.0" "0.0" "uniform" "0.0" "--no-use-global-cluster" \
+    "--fkd-precompute-batches" "--use-fkd-batches"
 
-  # MGD³: guidance=on (λ=0.1), uniform, soft label, classwise
+  # MGD³: guidance=on (λ=0.1), uniform, soft label, classwise cluster
+  #      classwise 聚类 + 文本提示词注入 (guidance-scale=3.0)
   run_method "MGD3" "$IPC" \
     "--lora-path ${LORA_PATH} --lora-scale 0.9" \
-    "0.1" "uniform" "0.0" "--no-use-global-cluster"
+    "0.1" "3.0" "uniform" "0.0" "--no-use-global-cluster" \
+    "--fkd-precompute-batches" "--use-fkd-batches"
 
-  # DDOQ: guidance=off, heuristic, soft label, classwise
+  # DDOQ: guidance=off, heuristic, soft label, classwise cluster
+  #       classwise 聚类 + 文本提示词注入 (guidance-scale=3.0)
   run_method "DDOQ" "$IPC" \
     "--lora-path ${LORA_PATH} --lora-scale 0.9" \
-    "0.0" "heuristic" "0.0" "--no-use-global-cluster"
+    "0.0" "3.0" "direct" "0.0" "--no-use-global-cluster" \
+    "--fkd-precompute-batches" "--use-fkd-batches"
 
-  # Ours: guidance=off, uniform, soft label, global cluster
+  # Ours: guidance=off, uniform, soft label, classwise cluster
+  #       classwise 聚类 + 无文本提示词注入 (guidance-scale=0.0)
   run_method "Ours" "$IPC" \
     "--lora-path ${LORA_PATH} --lora-scale 0.9" \
-    "0.0" "uniform" "0.0" "--use-global-cluster"
+    "0.0" "0.0" "heuristic" "0.0" "--no-use-global-cluster" \
+    "--fkd-precompute-batches" "--use-fkd-batches"
 done
 
 echo ""

@@ -24,6 +24,7 @@ TRAIN_CROP_MIN_SCALE="${TRAIN_CROP_MIN_SCALE:-0.08}"
 TRAIN_CROP_MAX_SCALE="${TRAIN_CROP_MAX_SCALE:-1.0}"
 TRAIN_HFLIP_PROB="${TRAIN_HFLIP_PROB:-0.5}"
 USE_FKD_BATCHES="${USE_FKD_BATCHES:-true}"
+HARD_LABEL_ALPHA="${HARD_LABEL_ALPHA:-0.0}"
 KD_TEMPERATURE="${KD_TEMPERATURE:-0}"
 TRAIN_LR="${TRAIN_LR:-4e-4}"
 
@@ -55,6 +56,7 @@ uv run run-train-distilled-student \
   --kd-temperature "$KD_TEMPERATURE" \
   --weight-balance-alpha 0.0 \
   --soft-label-sharpen 1.0 \
+  --hard-label-alpha "$HARD_LABEL_ALPHA" \
   --train-crop-min-scale "$TRAIN_CROP_MIN_SCALE" \
   --train-crop-max-scale "$TRAIN_CROP_MAX_SCALE" \
   --train-horizontal-flip-prob "$TRAIN_HFLIP_PROB" \
@@ -62,5 +64,3 @@ uv run run-train-distilled-student \
   --amp \
   --num-workers 4 \
   "$@"
-
-#   --hard-label-alpha 0.0 \

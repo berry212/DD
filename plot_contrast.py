@@ -2,7 +2,7 @@
 """绘制四种方法的 test_acc 和 test_loss 每 epoch 对比折线图。
 
 方法：
-  D4M:  no guidance, uniform weights, hard label, classwise cluster
+  D4M:  no guidance, uniform weights, soft label, classwise cluster
   MGD³: guidance on,  uniform weights, soft label, classwise cluster
   DDOQ: no guidance, heuristic weights, soft label, classwise cluster
   Ours: no guidance, uniform weights, soft label, global cluster

@@ -12,27 +12,32 @@ IPC="${IPC:-100}"
 DISTILL_METHOD="${DISTILL_METHOD:-clvq}"
 KMEANS_MAX_ITER="${KMEANS_MAX_ITER:-300}"
 CLVQ_MAX_ITER="${CLVQ_MAX_ITER:-10000}"
-CLVQ_BATCH_SIZE="${CLVQ_BATCH_SIZE:-1024}"
+CLVQ_BATCH_SIZE="${CLVQ_BATCH_SIZE:-256}"
+GLOBAL_CLVQ_BATCH_SIZE="${GLOBAL_CLVQ_BATCH_SIZE:-${CLVQ_BATCH_SIZE}}"
+CLASSWISE_CLVQ_BATCH_SIZE="${CLASSWISE_CLVQ_BATCH_SIZE:-${CLVQ_BATCH_SIZE}}"
 TEACHER_BACKBONE="${TEACHER_BACKBONE:-resnet18}"
 TEACHER_EPOCHS="${TEACHER_EPOCHS:-20}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/${DATASET}_224_distill_ipc${IPC}}"
 BASELINE_DIR="${BASELINE_DIR:-outputs/${DATASET}_224_distill_baseline}"
-GUIDANCE_SCALE="${GUIDANCE_SCALE:-3.0}"
+GUIDANCE_SCALE="${GUIDANCE_SCALE:-0.0}"
 SDE_STEPS="${SDE_STEPS:-200}"
 SDE_NOISE_STRENGTH="${SDE_NOISE_STRENGTH:-0.2}"
-WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-inverse}"
-WEIGHT_SMOOTH="${WEIGHT_SMOOTH:-0.5}"
+WEIGHTING_STRATEGY="${WEIGHTING_STRATEGY:-uniform}"
+WEIGHT_SMOOTH="${WEIGHT_SMOOTH:-0.0}"
 MODE_GUIDANCE_LAMBDA="${MODE_GUIDANCE_LAMBDA:-0.0}"
 MODE_GUIDANCE_T_STOP="${MODE_GUIDANCE_T_STOP:-80}"
+USE_GLOBAL_CLUSTER="${USE_GLOBAL_CLUSTER:-true}"
 
 DIFFUSION_MODEL_ID="runwayml/stable-diffusion-v1-5"
 
-TRAIN_EPOCHS="${TRAIN_EPOCHS:-50}"
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-20}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 TRAIN_CROP_MIN_SCALE="${TRAIN_CROP_MIN_SCALE:-0.08}"
 TRAIN_CROP_MAX_SCALE="${TRAIN_CROP_MAX_SCALE:-1.0}"
 TRAIN_HFLIP_PROB="${TRAIN_HFLIP_PROB:-0.5}"
 FKD_PRECOMPUTE_BATCHES="${FKD_PRECOMPUTE_BATCHES:-true}"
+FKD_TRAIN_EPOCHS="${FKD_TRAIN_EPOCHS:-300}"
+FKD_BATCH_SIZE="${FKD_BATCH_SIZE:-1024}"
 AUTO_TRAIN_TEACHER_BASELINE="${AUTO_TRAIN_TEACHER_BASELINE:-true}"
 TEACHER_TEMPERATURE="${TEACHER_TEMPERATURE:-20.0}"
 
@@ -84,6 +89,11 @@ if [[ "$FKD_PRECOMPUTE_BATCHES" == "false" ]]; then
   FKD_PRECOMPUTE_FLAG="--no-fkd-precompute-batches"
 fi
 
+GLOBAL_CLUSTER_FLAG="--use-global-cluster"
+if [[ "$USE_GLOBAL_CLUSTER" == "false" ]]; then
+  GLOBAL_CLUSTER_FLAG="--no-use-global-cluster"
+fi
+
 uv run run-distillation \
   --dataset "$DATASET" \
   --data-root "$DATA_ROOT" \
@@ -98,7 +108,8 @@ uv run run-distillation \
   --distill-method "$DISTILL_METHOD" \
   --kmeans-max-iter "$KMEANS_MAX_ITER" \
   --clvq-max-iter "$CLVQ_MAX_ITER" \
-  --clvq-batch-size "$CLVQ_BATCH_SIZE" \
+  --global-clvq-batch-size "$GLOBAL_CLVQ_BATCH_SIZE" \
+  --classwise-clvq-batch-size "$CLASSWISE_CLVQ_BATCH_SIZE" \
   --weighting-strategy "$WEIGHTING_STRATEGY" \
   --weight-smooth "$WEIGHT_SMOOTH" \
   --teacher-backbone "$TEACHER_BACKBONE" \
@@ -111,8 +122,9 @@ uv run run-distillation \
   --encode-batch-size 32 \
   --decode-batch-size 32 \
   "$FKD_PRECOMPUTE_FLAG" \
-  --fkd-train-epochs "$TRAIN_EPOCHS" \
-  --fkd-batch-size "$TRAIN_BATCH_SIZE" \
+  "$GLOBAL_CLUSTER_FLAG" \
+  --fkd-train-epochs "$FKD_TRAIN_EPOCHS" \
+  --fkd-batch-size "$FKD_BATCH_SIZE" \
   --fkd-crop-min-scale "$TRAIN_CROP_MIN_SCALE" \
   --fkd-crop-max-scale "$TRAIN_CROP_MAX_SCALE" \
   --fkd-horizontal-flip-prob "$TRAIN_HFLIP_PROB" \

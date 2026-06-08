@@ -85,23 +85,27 @@ for DATASET in ${DATASETS[*]}; do
           # Random 用硬标签: 对 teacher 输出的 argmax 做交叉熵
           HARD_LABEL_ALPHA="1.0"
           USE_FKD="false"
+          W_STRATEGY="${WEIGHTING_STRATEGY}"
           ;;
         kmeans)
           METHOD_LABEL="KMeans"
           # KMeans 用硬标签
           HARD_LABEL_ALPHA="1.0"
           USE_FKD="false"
+          W_STRATEGY="${WEIGHTING_STRATEGY}"
           ;;
         clvq)
           METHOD_LABEL="Ours"
           # Ours (CLVQ) 用软标签 — 知识蒸馏
           HARD_LABEL_ALPHA="0.0"
           USE_FKD="true"
+          W_STRATEGY="inverse"
           ;;
         *)
           METHOD_LABEL="$METHOD"
           HARD_LABEL_ALPHA="0.0"
           USE_FKD="true"
+          W_STRATEGY="${WEIGHTING_STRATEGY}"
           ;;
       esac
 
@@ -129,13 +133,16 @@ for DATASET in ${DATASETS[*]}; do
 
         if [[ "$DRY_RUN" == "1" ]]; then
           echo -e "    ${YELLOW}(dry-run)${NC} DATASET=${DATASET} IPC=${IPC} DISTILL_METHOD=${METHOD} bash distillate.sh"
+          echo -e "    ${YELLOW}(dry-run)${NC}   → USE_GLOBAL_CLUSTER=false FKD_PRECOMPUTE_BATCHES=${USE_FKD}"
           echo -e "    ${YELLOW}(dry-run)${NC}   → student: HARD_LABEL_ALPHA=${HARD_LABEL_ALPHA} USE_FKD_BATCHES=${USE_FKD}"
         else
           set +e
           DATASET="$DATASET" \
           IPC="$IPC" \
           DISTILL_METHOD="$METHOD" \
-          WEIGHTING_STRATEGY="$WEIGHTING_STRATEGY" \
+          WEIGHTING_STRATEGY="$W_STRATEGY" \
+          USE_GLOBAL_CLUSTER="${USE_GLOBAL_CLUSTER:-false}" \
+          FKD_PRECOMPUTE_BATCHES="${USE_FKD}" \
           OUTPUT_DIR="$DISTILL_OUT" \
           DATA_ROOT="$DATA_ROOT" \
           bash "$SCRIPT_DIR/distillate.sh"

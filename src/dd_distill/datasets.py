@@ -206,10 +206,9 @@ class APTOS2019BlindnessDetectionSpec(BaseDataset):
 
         def get_image_and_label(self, index: int) -> tuple[np.ndarray, int]:
             image_path = self.image_paths[index]
-            with Image.open(image_path) as pil_image:
-                # 转换为三通道图像，Resnet 18 的输入是 224*224*3
-                # image_np = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
-                image_np = pil_image
+            pil_image = Image.open(image_path).convert("RGB")
+            pil_image.load()  # 强制加载图片数据，避免后续 lazy loading 时文件句柄被关闭
+            image_np = np.asarray(pil_image, dtype=np.uint8)
             return image_np, self.labels[index]
 
         def get_all_labels(self) -> np.ndarray:
@@ -251,11 +250,27 @@ class APTOS2019BlindnessDetectionSpec(BaseDataset):
 
     @override
     def load_dataset_splits(self, data_root: str, image_size: int) -> DatasetSplit:
-        train_set = self.Image_Split(*self._load_data_conf(data_root, split='train'))
+        # train: 仅使用官方 train.csv，按 9:1 随机划分为 train / val
+        image_paths, labels = self._load_data_conf(data_root, split='train')
+        indices = np.arange(labels.shape[0], dtype=np.int64)
 
-        val_set = self.Image_Split(*self._load_data_conf(data_root, split='test'))
+        train_idx, val_idx = train_test_split(
+            indices,
+            test_size=0.1,
+            random_state=42,
+            shuffle=True,
+            stratify=labels,
+        )
 
-        test_set = self.Image_Split(*self._load_data_conf(data_root, split='val'))
+        train_set = self.Image_Split(
+            [image_paths[int(i)] for i in train_idx], labels[train_idx]
+        )
+        val_set = self.Image_Split(
+            [image_paths[int(i)] for i in val_idx], labels[val_idx]
+        )
+
+        # test: 使用官方 test.csv（与原 abbfb0b 一致）
+        test_set = self.Image_Split(*self._load_data_conf(data_root, split='test'))
 
         return DatasetSplit(
             train_set=train_set,

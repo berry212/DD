@@ -50,7 +50,7 @@ def global_clvq(
             max_iter=max_iter,
             n_init=3,
             tol=float(max(tol, 1e-8)),
-            reassignment_ratio=0.01,
+            reassignment_ratio=0.1,
         )
         assignments = kmeans_mb.fit_predict(flat_latents)
         centers = kmeans_mb.cluster_centers_.astype(np.float32, copy=False)
@@ -93,6 +93,104 @@ def global_clvq(
     print(
         f"[CLVQ/{backend_label}-Global] n_samples={n_samples} total_k={total_k} "
         f"kept={centers.shape[0]} batch_size={minibatch_size} max_iter={max_iter}"
+    )
+
+    return ClusterResult(
+        centers=centers_t,
+        center_labels=labels_t,
+        counts=counts_t,
+        weights=weights_t,
+    )
+
+
+def classwise_clvq(
+    latents: torch.Tensor,
+    labels: torch.Tensor,
+    clusters_per_class: float,
+    num_classes: int,
+    seed: int,
+    max_iter: int,
+    tol: float,
+    minibatch_size: int,
+    weighting_strategy: str,
+    kmeans_max_iter: int = 300,
+    weight_smooth: float = 0.0,
+) -> ClusterResult:
+    """Per-class (classwise) CLVQ: cluster within each class independently,
+    then concatenate results across all classes."""
+    latents = latents.float().cpu()
+    labels = labels.long().view(-1).cpu()
+    flat_latents = latents.view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
+    labels_np = labels.numpy().astype(np.int64, copy=False)
+    n_samples = flat_latents.shape[0]
+
+    ipc = max(1, int(clusters_per_class))
+    all_centers: list[np.ndarray] = []
+    all_center_labels: list[int] = []
+    all_counts: list[int] = []
+
+    for class_id in range(num_classes):
+        class_mask = labels_np == class_id
+        class_indices = np.where(class_mask)[0]
+        class_n = int(class_indices.size)
+
+        if class_n == 0:
+            print(f"[CLVQ-Classwise] class={class_id} has 0 samples, skipping.")
+            continue
+
+        k = min(ipc, class_n)
+
+        if class_n <= k:
+            # Not enough samples in this class — use all directly
+            class_centers = flat_latents[class_indices].astype(np.float32, copy=True)
+            class_counts = np.ones(class_n, dtype=np.int64)
+            backend_label = "NoCluster"
+        else:
+            kmeans_mb = MiniBatchKMeans(
+                n_clusters=k,
+                random_state=seed + class_id,
+                batch_size=min(minibatch_size, class_n),
+                max_iter=max_iter,
+                n_init=3,
+                tol=float(max(tol, 1e-8)),
+                reassignment_ratio=0.1,
+            )
+            class_centers = kmeans_mb.fit(flat_latents[class_indices]).cluster_centers_
+            class_centers = class_centers.astype(np.float32, copy=False)
+
+            # Assign class samples to centers for counting
+            class_assignments = assign_to_centers(
+                flat_latents[class_indices], class_centers, batch_size=2048
+            )
+            class_counts = np.bincount(class_assignments, minlength=k).astype(np.int64)
+            backend_label = "MiniBatchKMeans"
+
+        all_centers.append(class_centers)
+        all_center_labels.extend([class_id] * class_centers.shape[0])
+        all_counts.extend(class_counts.tolist())
+
+    if len(all_centers) == 0:
+        raise RuntimeError("Classwise CLVQ failed: no centers produced across any class.")
+
+    centers_full = np.concatenate(all_centers, axis=0)
+    center_labels_arr = np.array(all_center_labels, dtype=np.int64)
+    counts_arr = np.array(all_counts, dtype=np.int64)
+
+    centers_t = torch.from_numpy(centers_full).view(centers_full.shape[0], *latents.shape[1:]).float()
+    labels_t = torch.from_numpy(center_labels_arr).long()
+    counts_t = torch.from_numpy(counts_arr).long()
+    weights_t = compute_cluster_weights(
+        counts_t=counts_t,
+        labels_t=labels_t,
+        num_classes=num_classes,
+        strategy=weighting_strategy,
+        weight_smooth=weight_smooth,
+    )
+
+    print(
+        f"[CLVQ/{backend_label}-Classwise] n_samples={n_samples} ipc={ipc} "
+        f"total_centers={centers_full.shape[0]} classes_present={len(all_centers)} "
+        f"batch_size={minibatch_size} max_iter={max_iter}"
     )
 
     return ClusterResult(

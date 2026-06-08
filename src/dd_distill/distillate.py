@@ -356,6 +356,152 @@ def global_kmeans_nearest_selection(
     return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
 
 
+def classwise_random_selection(
+    labels: torch.Tensor,
+    clusters_per_class: float,
+    num_classes: int,
+    seed: int,
+    weighting_strategy: str,
+    weight_smooth: float = 0.0,
+    per_class_ipc: dict[int, int] | None = None,
+) -> SelectedSamplesResult:
+    """Per-class (classwise) random selection: pick ipc samples per class independently."""
+    if clusters_per_class <= 0:
+        raise ValueError("clusters_per_class must be positive.")
+
+    labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
+    n_total = int(labels_np.shape[0])
+    ipc = max(1, int(clusters_per_class))
+
+    per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
+    rng = np.random.default_rng(seed)
+
+    all_picked: list[int] = []
+    all_picked_labels: list[int] = []
+
+    for class_id in range(num_classes):
+        class_mask = labels_np == class_id
+        class_indices = np.where(class_mask)[0]
+        class_n = int(class_indices.size)
+
+        if class_n == 0:
+            print(f"[Random-Classwise] class={class_id} has 0 samples, skipping.")
+            continue
+
+        k = per_class.get(class_id, ipc)
+        k = max(1, min(k, class_n))
+
+        picked_idx = np.asarray(rng.choice(class_indices, size=k, replace=False), dtype=np.int64)
+        all_picked.extend(picked_idx.tolist())
+        all_picked_labels.extend([class_id] * k)
+
+    if len(all_picked) == 0:
+        raise RuntimeError("Classwise random selection failed: no samples selected.")
+
+    picked = np.array(all_picked, dtype=np.int64)
+    picked_labels = np.array(all_picked_labels, dtype=np.int64)
+
+    print(f"[Random-Classwise] total_selected={picked.shape[0]} ipc={ipc}")
+    for class_id in range(num_classes):
+        cnt = int(np.sum(picked_labels == class_id))
+        if cnt > 0:
+            print(f"  class={class_id} selected={cnt}")
+
+    indices_t = torch.from_numpy(picked).long()
+    labels_t = torch.from_numpy(picked_labels).long()
+    total_k = int(picked.shape[0])
+    counts_t = torch.ones((total_k,), dtype=torch.long)
+    weights_t = compute_cluster_weights(
+        counts_t=counts_t,
+        labels_t=labels_t,
+        num_classes=num_classes,
+        strategy=weighting_strategy,
+        weight_smooth=weight_smooth,
+    )
+
+    return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
+
+
+def classwise_kmeans_nearest_selection(
+    latents: torch.Tensor,
+    labels: torch.Tensor,
+    clusters_per_class: float,
+    num_classes: int,
+    seed: int,
+    weighting_strategy: str,
+    kmeans_max_iter: int,
+    weight_smooth: float = 0.0,
+    per_class_ipc: dict[int, int] | None = None,
+) -> SelectedSamplesResult:
+    """Per-class KMeans clustering, then select the nearest sample to each center."""
+    if clusters_per_class <= 0:
+        raise ValueError("clusters_per_class must be positive.")
+
+    kmeans_max_iter = max(10, int(kmeans_max_iter))
+    flat_latents = latents.float().cpu().view(latents.size(0), -1).numpy().astype(np.float32, copy=False)
+    labels_np = labels.long().view(-1).cpu().numpy().astype(np.int64, copy=False)
+    n_samples = int(flat_latents.shape[0])
+    ipc = max(1, int(clusters_per_class))
+
+    per_class = dict(per_class_ipc) if per_class_ipc is not None else {}
+
+    all_picked: list[int] = []
+    all_picked_labels: list[int] = []
+    all_counts: list[int] = []
+
+    for class_id in range(num_classes):
+        class_mask = labels_np == class_id
+        class_indices = np.where(class_mask)[0]
+        class_n = int(class_indices.size)
+
+        if class_n == 0:
+            print(f"[KMeans-Classwise] class={class_id} has 0 samples, skipping.")
+            continue
+
+        k = per_class.get(class_id, ipc)
+        k = max(1, min(k, class_n))
+
+        class_latents = flat_latents[class_indices]
+
+        if class_n <= k:
+            # Not enough samples — use all
+            picked_local = np.arange(class_n, dtype=np.int64)
+            counts_local = np.ones(class_n, dtype=np.int64)
+        else:
+            kmeans = KMeans(n_clusters=k, random_state=seed + class_id, n_init=10, max_iter=kmeans_max_iter)
+            kmeans.fit(class_latents)
+            assignments = kmeans.labels_
+            counts_local = np.bincount(assignments, minlength=k).astype(np.int64)
+            picked_local = nearest_samples_to_centers_unique(class_latents, kmeans.cluster_centers_)
+
+        global_indices = class_indices[picked_local]
+        all_picked.extend(global_indices.tolist())
+        all_picked_labels.extend([class_id] * len(global_indices))
+        all_counts.extend(counts_local.tolist())
+
+    if len(all_picked) == 0:
+        raise RuntimeError("Classwise KMeans selection failed: no samples selected.")
+
+    picked = np.array(all_picked, dtype=np.int64)
+    picked_labels = np.array(all_picked_labels, dtype=np.int64)
+    counts = np.array(all_counts, dtype=np.int64)
+
+    print(f"[KMeans-Classwise] n_samples={n_samples} ipc={ipc} total_selected={picked.shape[0]}")
+
+    indices_t = torch.from_numpy(picked).long()
+    labels_t = torch.from_numpy(picked_labels).long()
+    counts_t = torch.from_numpy(counts).long()
+    weights_t = compute_cluster_weights(
+        counts_t=counts_t,
+        labels_t=labels_t,
+        num_classes=num_classes,
+        strategy=weighting_strategy,
+        weight_smooth=weight_smooth,
+    )
+
+    return SelectedSamplesResult(indices=indices_t, labels=labels_t, counts=counts_t, weights=weights_t)
+
+
 def iter_images_by_indices(
     train_set: Any,
     indices: torch.Tensor,
@@ -865,19 +1011,38 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
     decoder: ReverseSDEDecoder | DiTDecoder | None = None
 
     if args.distill_method == "clvq":
-        clvq = global_clvq(
-            latents=latents,
-            labels=latent_labels,
-            clusters_per_class=args.clusters_per_class,
-            num_classes=num_classes,
-            seed=args.seed,
-            max_iter=args.clvq_max_iter,
-            tol=args.clvq_tol,
-            minibatch_size=args.clvq_batch_size,
-            weighting_strategy=args.weighting_strategy,
-            kmeans_max_iter=args.kmeans_max_iter,
-            weight_smooth=args.weight_smooth,
-        )
+        use_global = bool(args.use_global_cluster)
+        # 分别解析 global/classwise batch_size
+        global_bs = args.global_clvq_batch_size if args.global_clvq_batch_size is not None else args.clvq_batch_size
+        classwise_bs = args.classwise_clvq_batch_size if args.classwise_clvq_batch_size is not None else args.clvq_batch_size
+        if use_global:
+            clvq = global_clvq(
+                latents=latents,
+                labels=latent_labels,
+                clusters_per_class=args.clusters_per_class,
+                num_classes=num_classes,
+                seed=args.seed,
+                max_iter=args.clvq_max_iter,
+                tol=args.clvq_tol,
+                minibatch_size=global_bs,
+                weighting_strategy=args.weighting_strategy,
+                kmeans_max_iter=args.kmeans_max_iter,
+                weight_smooth=args.weight_smooth,
+            )
+        else:
+            clvq = classwise_clvq(
+                latents=latents,
+                labels=latent_labels,
+                clusters_per_class=args.clusters_per_class,
+                num_classes=num_classes,
+                seed=args.seed,
+                max_iter=args.clvq_max_iter,
+                tol=args.clvq_tol,
+                minibatch_size=classwise_bs,
+                weighting_strategy=args.weighting_strategy,
+                kmeans_max_iter=args.kmeans_max_iter,
+                weight_smooth=args.weight_smooth,
+            )
 
         if is_dit:
             decoder = DiTDecoder(
@@ -921,15 +1086,27 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_counts = clvq.counts
         distilled_weights = clvq.weights
     elif args.distill_method == "random":
-        selected = global_random_selection(
-            labels=latent_labels,
-            clusters_per_class=args.clusters_per_class,
-            num_classes=num_classes,
-            seed=args.seed,
-            weighting_strategy=args.weighting_strategy,
-            weight_smooth=args.weight_smooth,
-            per_class_ipc=per_class_ipc,
-        )
+        use_global = bool(args.use_global_cluster)
+        if use_global:
+            selected = global_random_selection(
+                labels=latent_labels,
+                clusters_per_class=args.clusters_per_class,
+                num_classes=num_classes,
+                seed=args.seed,
+                weighting_strategy=args.weighting_strategy,
+                weight_smooth=args.weight_smooth,
+                per_class_ipc=per_class_ipc,
+            )
+        else:
+            selected = classwise_random_selection(
+                labels=latent_labels,
+                clusters_per_class=args.clusters_per_class,
+                num_classes=num_classes,
+                seed=args.seed,
+                weighting_strategy=args.weighting_strategy,
+                weight_smooth=args.weight_smooth,
+                per_class_ipc=per_class_ipc,
+            )
         expected_labels = selected.labels.long().cpu()
         stream_iter = iter_images_by_indices(
             train_set=train_set,
@@ -941,17 +1118,31 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         distilled_counts = selected.counts
         distilled_weights = selected.weights
     elif args.distill_method == "kmeans":
-        selected = global_kmeans_nearest_selection(
-            latents=latents,
-            labels=latent_labels,
-            clusters_per_class=args.clusters_per_class,
-            num_classes=num_classes,
-            seed=args.seed,
-            weighting_strategy=args.weighting_strategy,
-            kmeans_max_iter=args.kmeans_max_iter,
-            weight_smooth=args.weight_smooth,
-            per_class_ipc=per_class_ipc,
-        )
+        use_global = bool(args.use_global_cluster)
+        if use_global:
+            selected = global_kmeans_nearest_selection(
+                latents=latents,
+                labels=latent_labels,
+                clusters_per_class=args.clusters_per_class,
+                num_classes=num_classes,
+                seed=args.seed,
+                weighting_strategy=args.weighting_strategy,
+                kmeans_max_iter=args.kmeans_max_iter,
+                weight_smooth=args.weight_smooth,
+                per_class_ipc=per_class_ipc,
+            )
+        else:
+            selected = classwise_kmeans_nearest_selection(
+                latents=latents,
+                labels=latent_labels,
+                clusters_per_class=args.clusters_per_class,
+                num_classes=num_classes,
+                seed=args.seed,
+                weighting_strategy=args.weighting_strategy,
+                kmeans_max_iter=args.kmeans_max_iter,
+                weight_smooth=args.weight_smooth,
+                per_class_ipc=per_class_ipc,
+            )
         expected_labels = selected.labels.long().cpu()
         stream_iter = iter_images_by_indices(
             train_set=train_set,
@@ -1125,6 +1316,7 @@ def run_distillation(args: argparse.Namespace) -> dict[str, Any]:
         "teacher_checkpoint": str(teacher_ckpt_path),
         "num_classes": int(num_classes),
         "distill_method": str(args.distill_method),
+        "use_global_cluster": bool(args.use_global_cluster),
         "clustering_backend": "MiniBatchKMeans" if args.distill_method == "clvq" else str(args.distill_method),
         "clusters_per_class": float(args.clusters_per_class),
         "clvq_batch_size": int(args.clvq_batch_size),
@@ -1166,14 +1358,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--clusters-per-class", type=float, default=100.0)
     parser.add_argument("--distill-method", type=str, default="clvq", choices=["clvq", "random", "kmeans"])
+    parser.add_argument("--use-global-cluster", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use global clustering across all classes (default). "
+                             "--no-use-global-cluster for per-class (classwise) clustering.")
     parser.add_argument("--clvq-max-iter", type=int, default=10000)
     parser.add_argument("--clvq-tol", type=float, default=1e-5)
-    parser.add_argument("--clvq-batch-size", type=int, default=1024)
+    parser.add_argument("--clvq-batch-size", type=int, default=1024,
+                        help="Deprecated, use --global-clvq-batch-size / --classwise-clvq-batch-size instead.")
+    parser.add_argument("--global-clvq-batch-size", type=int, default=None,
+                        help="MiniBatchKMeans batch size for global clustering (default: clvq-batch-size).")
+    parser.add_argument("--classwise-clvq-batch-size", type=int, default=None,
+                        help="MiniBatchKMeans batch size for classwise clustering (default: clvq-batch-size).")
     parser.add_argument("--kmeans-max-iter", type=int, default=300)
     parser.add_argument(
         "--weighting-strategy",
         type=str,
-        default="heuristic",
+        default="uniform",
         choices=["heuristic", "direct", "uniform", "inverse"],
     )
     parser.add_argument(
